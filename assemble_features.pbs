@@ -34,7 +34,8 @@
 
 set -euo pipefail
 
-module load python3/3.11.7
+# Allow PYTHON_BIN to be overridden externally; default to 'python3' if not set
+export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}"
 
 # Working dir for spectra + intermediate products. Point at scratch/gdata so the
 # ~44k FITS files and the ~1.5 GB allStar summary don't fill $HOME.
@@ -43,8 +44,8 @@ export SPPHOT_POOL="${SPPHOT_POOL:-16}"
 mkdir -p "${SPPHOT_WORK}"
 
 STAGE="${STAGE:-all}"
-echo "[pbs] host=$(hostname) stage=${STAGE} work=${SPPHOT_WORK} pool=${SPPHOT_POOL}"
+echo "[pbs] host=$(hostname) stage=${STAGE} work=${SPPHOT_WORK} pool=${SPPHOT_POOL} python_bin=${PYTHON_BIN}"
 
-python3 assemble_features.py "${STAGE}"
+${PYTHON_BIN} assemble_features.py "${STAGE}"
 
 echo "[pbs] done stage=${STAGE}"
