@@ -1,15 +1,15 @@
 #!/bin/bash
 #PBS -N assemble_features
-#PBS -P <PROJECT>
+#PBS -P mk27
 #PBS -q copyq
 #PBS -l ncpus=1
 #PBS -l mem=32GB
 #PBS -l walltime=10:00:00
-#PBS -l storage=scratch/<PROJECT>+gdata/<PROJECT>
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
 #PBS -l wd
 #PBS -j oe
 #PBS -m abe
-#PBS -M majajjablonska@gmail.com
+#PBS -M maja.jablonska@anu.edu.au
 
 # --------------------------------------------------------------------------
 # Gadi job for assemble_features.py — builds the (N, 7405) spectral matrix +
