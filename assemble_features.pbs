@@ -1,0 +1,50 @@
+#!/bin/bash
+#PBS -N assemble_features
+#PBS -P <PROJECT>
+#PBS -q copyq
+#PBS -l ncpus=1
+#PBS -l mem=32GB
+#PBS -l walltime=10:00:00
+#PBS -l storage=scratch/<PROJECT>+gdata/<PROJECT>
+#PBS -l wd
+#PBS -j oe
+#PBS -m abe
+#PBS -M majajjablonska@gmail.com
+
+# --------------------------------------------------------------------------
+# Gadi job for assemble_features.py — builds the (N, 7405) spectral matrix +
+# (N, 8) photometry array for the Hogg+18 spectrophotometric-parallax model.
+#
+# Runs on copyq: the only Gadi queue with outbound internet, which the
+# crossmatch (ESA Gaia archive) and fetch (SDSS SAS) stages require. copyq is
+# single-cpu but the download pool is thread-based (I/O bound), so POOL>1 still
+# helps. copyq caps walltime at 10h; resume by re-submitting (all stages are
+# checkpointed — fetch skips files already on disk).
+#
+# Submit one stage at a time, e.g.:
+#   qsub -v STAGE=crossmatch assemble_features.pbs
+#   qsub -v STAGE=fetch      assemble_features.pbs
+#   qsub -v STAGE=build      assemble_features.pbs
+# Default (no -v) runs all three in sequence.
+#
+# Set <PROJECT> above to your NCI project code before submitting. For the
+# authenticated (fast) crossmatch path, also export GAIA_USER / GAIA_PASS,
+# e.g.: qsub -v STAGE=crossmatch,GAIA_USER=me,GAIA_PASS=secret ...
+# --------------------------------------------------------------------------
+
+set -euo pipefail
+
+module load python3/3.11.7
+
+# Working dir for spectra + intermediate products. Point at scratch/gdata so the
+# ~44k FITS files and the ~1.5 GB allStar summary don't fill $HOME.
+export SPPHOT_WORK="${SPPHOT_WORK:-/scratch/<PROJECT>/${USER}/spphot_data}"
+export SPPHOT_POOL="${SPPHOT_POOL:-16}"
+mkdir -p "${SPPHOT_WORK}"
+
+STAGE="${STAGE:-all}"
+echo "[pbs] host=$(hostname) stage=${STAGE} work=${SPPHOT_WORK} pool=${SPPHOT_POOL}"
+
+python3 assemble_features.py "${STAGE}"
+
+echo "[pbs] done stage=${STAGE}"

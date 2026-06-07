@@ -1,0 +1,14 @@
+# generated data / intermediate products
+spphot_data/
+*.npz
+xmatch.fits
+allStar*.fits
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# jupyter
+.ipynb_checkpoints/
