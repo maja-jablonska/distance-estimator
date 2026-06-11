@@ -57,6 +57,19 @@ def load_metadata(parquet_path, allstar_path):
         if getattr(arr.dtype, "byteorder", "=") == ">":
             allstar[c] = arr.astype(arr.dtype.newbyteorder("="))
 
+    # astra allStar has one row per spectrum/reduction, so a star (sdss_id) can
+    # appear several times; META_COLS are per-star quantities, so keep one row
+    # per star — preferring the most complete one in case duplicates carry NaNs.
+    n_dup = int(allstar["sdss_id"].duplicated().sum())
+    if n_dup:
+        completeness = allstar[["plx", "e_plx", *LABEL_COLS]].notna().sum(axis=1)
+        allstar = (allstar.assign(_complete=completeness)
+                   .sort_values("_complete", ascending=False, kind="stable")
+                   .drop_duplicates("sdss_id")
+                   .drop(columns="_complete"))
+        log(f"allStar: collapsed {n_dup} duplicate sdss_id rows "
+            f"-> {len(allstar)} unique stars")
+
     log("reading parquet scalar columns (sdss_id, snr, spectrum_flags) ...")
     meta = pq.read_table(parquet_path,
                          columns=["sdss_id", "snr", "spectrum_flags"]).to_pandas()
