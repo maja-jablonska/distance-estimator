@@ -1,0 +1,65 @@
+#!/bin/bash
+#PBS -N spphot_full
+#PBS -P mk27
+#PBS -q normal
+#PBS -l ncpus=48
+#PBS -l mem=190GB
+#PBS -l walltime=03:00:00
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
+#PBS -l wd
+#PBS -j oe
+#PBS -m abe
+#PBS -M maja.jablonska@anu.edu.au
+
+# --------------------------------------------------------------------------
+# Full-dataset spectrophotometric-parallax run (~800k stars) — run_full_gadi.py
+#
+# Compute job (NOT copyq): no internet needed, but it is memory + BLAS heavy.
+#   - the ln-flux matrix is ~800k x 7492 float32 ~ 24 GB, and transiently ~2x
+#     while the good-pixel slice is taken -> request a full normal node (190 GB).
+#   - the fits are dense matmuls; give BLAS/JAX all the cores on the node.
+#
+# If you hit a walltime/memory wall, the cheapest knobs are:
+#   --batch-rows (smaller = lower peak RAM during the streaming pass)
+#   move to -q hugemem (1.5 TB) for very large pixel grids.
+#
+# Submit:
+#   qsub run_full_gadi.pbs
+#   # override paths / lambda without editing this file:
+#   qsub -v LAM=0.03 run_full_gadi.pbs
+# --------------------------------------------------------------------------
+
+set -euo pipefail
+
+export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}"
+
+# data locations (the notebook's SRC = /home/100/mj8805/scr_mk27)
+SRC="${SRC:-/scratch/mk27/mj8805}"
+DATA="${DATA:-${SRC}/bulge-ages-and-orbits/data}"
+PARQUET="${PARQUET:-${DATA}/spectra_infer_parallax.parquet}"
+ALLSTAR="${ALLSTAR:-${DATA}/astraAllStarASPCAP-0.8.0.fits}"
+OUT="${OUT:-/scratch/mk27/${USER}/spphot_results_full.parquet}"
+LAM="${LAM:-0.1}"
+BATCH_ROWS="${BATCH_ROWS:-20000}"
+
+# threads: let BLAS (warm-start XtX) and JAX (refine) use the whole node
+export OMP_NUM_THREADS="${PBS_NCPUS:-48}"
+export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
+export OPENBLAS_NUM_THREADS="${OMP_NUM_THREADS}"
+export XLA_FLAGS="--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=${OMP_NUM_THREADS}"
+export JAX_ENABLE_X64=1
+export JAX_PLATFORMS=cpu          # this node has no GPU; skip the CUDA probe/warning
+
+mkdir -p "$(dirname "${OUT}")"
+echo "[pbs] host=$(hostname) ncpus=${PBS_NCPUS:-?} parquet=${PARQUET}"
+echo "[pbs] allstar=${ALLSTAR}"
+echo "[pbs] out=${OUT} lam=${LAM} batch_rows=${BATCH_ROWS}"
+
+${PYTHON_BIN} run_full_gadi.py \
+    --parquet "${PARQUET}" \
+    --allstar "${ALLSTAR}" \
+    --out     "${OUT}" \
+    --lam     "${LAM}" \
+    --batch-rows "${BATCH_ROWS}"
+
+echo "[pbs] done -> ${OUT}"
