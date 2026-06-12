@@ -1,5 +1,6 @@
-"""Verify that the 'pixel_flags' column is identical between hdus[3] and hdus[4]
-(the two telescopes) for every FITS file in a directory.
+"""Check whether all spectra share a single common 'pixel_flags' mask per telescope:
+one mask for every spectrum found in hdus[3] (APO), and one for every spectrum
+in hdus[4] (LCO). Empty HDUs (shape (0, 0)) are ignored.
 
 Usage: python check_pixel_flags.py <dir_or_glob> [more dirs/globs...]
 """
@@ -29,28 +30,44 @@ def main():
     if not files:
         sys.exit("No FITS files found")
 
-    n_same = n_diff = n_skip = 0
+    # per HDU index: reference mask, the file it came from, counts
+    ref = {3: None, 4: None}
+    ref_file = {3: None, 4: None}
+    n_spectra = {3: 0, 4: 0}
+    n_diff = {3: 0, 4: 0}
+    n_skip = 0
+
     for path in files:
         try:
             with fits.open(path) as hdus:
-                a = hdus[3].data["pixel_flags"]
-                b = hdus[4].data["pixel_flags"]
+                for idx in (3, 4):
+                    data = hdus[idx].data
+                    if data is None or data["pixel_flags"].size == 0:
+                        continue
+                    for mask in np.atleast_2d(data["pixel_flags"]):
+                        n_spectra[idx] += 1
+                        if ref[idx] is None:
+                            ref[idx] = mask.copy()
+                            ref_file[idx] = path
+                        elif not np.array_equal(mask, ref[idx]):
+                            n_pix = np.sum(mask != ref[idx])
+                            print(f"DIFF  hdus[{idx}] {path}: {n_pix}/{mask.size} pixels differ from {ref_file[idx]}")
+                            n_diff[idx] += 1
         except Exception as e:
             print(f"SKIP  {path}: {e}")
             n_skip += 1
-            continue
 
-        if a.shape != b.shape:
-            print(f"DIFF  {path}: shape mismatch {a.shape} vs {b.shape}")
-            n_diff += 1
-        elif np.array_equal(a, b):
-            n_same += 1
+    print()
+    for idx in (3, 4):
+        if n_spectra[idx] == 0:
+            print(f"hdus[{idx}]: no spectra found")
+        elif n_diff[idx] == 0:
+            print(f"hdus[{idx}]: all {n_spectra[idx]} spectra share one mask "
+                  f"({np.sum(ref[idx] != 0)}/{ref[idx].size} pixels flagged)")
         else:
-            n_mismatch = np.sum(a != b)
-            print(f"DIFF  {path}: {n_mismatch}/{a.size} values differ")
-            n_diff += 1
-
-    print(f"\n{len(files)} files: {n_same} identical, {n_diff} different, {n_skip} skipped")
+            print(f"hdus[{idx}]: {n_diff[idx]}/{n_spectra[idx]} spectra differ from reference ({ref_file[idx]})")
+    if n_skip:
+        print(f"{n_skip} files skipped")
 
 
 if __name__ == "__main__":
