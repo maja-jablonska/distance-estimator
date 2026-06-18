@@ -1,0 +1,57 @@
+#!/bin/bash
+#PBS -N build_pixel_mask
+#PBS -P mk27
+#PBS -q normal
+#PBS -l ncpus=4
+#PBS -l mem=32GB
+#PBS -l walltime=01:00:00
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
+#PBS -l wd
+#PBS -j oe
+#PBS -m abe
+#PBS -M maja.jablonska@anu.edu.au
+
+# --------------------------------------------------------------------------
+# Gadi job for build_pixel_mask.py — builds the "lit anywhere" pixel mask
+# (per telescope) and attaches the Gaia parallax zero-point.
+#
+# Light job: streams the parquet in batches reading only pixel_flags + the few
+# scalar columns zpt needs, so it never holds the whole frame in memory. No
+# internet required (zpt.load_tables() reads tables shipped with the package),
+# so this runs on -q normal rather than copyq.
+#
+# Submit:
+#   qsub build_pixel_mask.pbs
+#   # override paths / batch size without editing this file:
+#   qsub -v PARQUET=/path/to.parquet,OUT_DIR=/scratch/mk27/me/masks build_pixel_mask.pbs
+#   # one half only:
+#   qsub -v EXTRA=--skip-zpt  build_pixel_mask.pbs
+#   qsub -v EXTRA=--skip-mask build_pixel_mask.pbs
+# --------------------------------------------------------------------------
+
+set -euo pipefail
+
+export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}"
+
+# data locations (mirror run_full_gadi.pbs)
+SRC="${SRC:-/scratch/mk27/mj8805}"
+DATA="${DATA:-${SRC}/bulge-ages-and-orbits/data}"
+PARQUET="${PARQUET:-${DATA}/spectra_infer_parallax.parquet}"
+OUT_DIR="${OUT_DIR:-/scratch/mk27/${USER}/pixel_mask}"
+BATCH_SIZE="${BATCH_SIZE:-20000}"
+EXTRA="${EXTRA:-}"
+
+export OMP_NUM_THREADS="${PBS_NCPUS:-4}"
+export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
+export OPENBLAS_NUM_THREADS="${OMP_NUM_THREADS}"
+
+mkdir -p "${OUT_DIR}"
+echo "[pbs] host=$(hostname) ncpus=${PBS_NCPUS:-?} parquet=${PARQUET}"
+echo "[pbs] out_dir=${OUT_DIR} batch_size=${BATCH_SIZE} extra=${EXTRA}"
+
+${PYTHON_BIN} build_pixel_mask.py "${PARQUET}" \
+    --out-dir "${OUT_DIR}" \
+    --batch-size "${BATCH_SIZE}" \
+    ${EXTRA}
+
+echo "[pbs] done -> ${OUT_DIR}"
