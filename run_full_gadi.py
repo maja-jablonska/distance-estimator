@@ -28,6 +28,13 @@ Usage (see run_full_gadi.pbs):
 """
 from __future__ import annotations
 import os, sys, time, argparse
+
+# The fit is small dense ridge + L-BFGS — run it on CPU. Forcing this before JAX is
+# imported avoids the GPU/CuDNN probe that crashes on a CuDNN runtime/compile version
+# mismatch (RET_CHECK failure ... dnn_support != nullptr). setdefault so an explicit
+# JAX_PLATFORMS in the environment still wins.
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -273,8 +280,11 @@ def fit_parallax_model(X, plx, sigma, lam, maxiter=2000):
     Xj, yj, sj, regj = (jnp.asarray(np.asarray(v, float)) for v in (X, plx, sigma, reg))
     invN = 1.0 / N
 
+    # pass the data as traced args (not closed-over) so XLA does NOT bake the full
+    # design matrix into the compiled fn as a multi-GB constant; it stays a device
+    # buffer compiled once and reused every L-BFGS step.
     @jax.jit
-    def value_and_grad(theta):
+    def value_and_grad(theta, Xj, yj, sj, regj):
         def obj(th):
             m = jnp.exp(jnp.clip(Xj @ th, -30, 30))
             r = (yj - m) / sj
@@ -282,7 +292,7 @@ def fit_parallax_model(X, plx, sigma, lam, maxiter=2000):
         return jax.value_and_grad(obj)(theta)
 
     def scipy_obj(theta):
-        fv, g = value_and_grad(jnp.asarray(theta))
+        fv, g = value_and_grad(jnp.asarray(theta), Xj, yj, sj, regj)
         return float(fv), np.asarray(g, np.float64)
 
     res = minimize(scipy_obj, theta0, jac=True, method="L-BFGS-B",
