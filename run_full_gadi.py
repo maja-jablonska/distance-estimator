@@ -251,7 +251,7 @@ def design(phot, spec, stats=None):
     return np.hstack([np.ones((len(A), 1)), A]), stats
 
 
-def fit_parallax_model(X, plx, sigma, lam, maxiter=100, gtol=1e-7, ftol=1e-12):
+def _gn_fit(X, plx, sigma, lam, maxiter=100, gtol=1e-7, ftol=1e-12):
     """theta for plx ~ exp(X @ theta): Gaussian-in-parallax NLL + L2 ridge.
 
     Log-space ridge warm-start (positive parallaxes), then a damped Gauss-Newton
@@ -339,6 +339,46 @@ def fit_parallax_model(X, plx, sigma, lam, maxiter=100, gtol=1e-7, ftol=1e-12):
     return theta, res
 
 
+def fit_parallax_model(X, plx, sigma, lam, maxiter=100, gtol=1e-7, ftol=1e-12,
+                       clip_sigma=0.0, clip_rounds=5):
+    """Fit theta (see _gn_fit) with optional iterative training-set sigma-clipping.
+
+    When clip_sigma > 0: after each GN fit, standardize the parallax residual
+    chi = (plx - m)/sigma, drop the stars more than clip_sigma robust deviations
+    (1.48*MAD) from the median, and refit on the survivors — up to clip_rounds
+    times (monotonic: a clipped star never returns). This stops the non-robust GN
+    from chasing stars it cannot fit within their quoted Gaia errors (binaries, bad
+    astrometry, peculiar spectra).
+
+    CAUTION: clipping the parallax residual is in tension with the Paper I
+    commitment to never cut on parallax — it can bias the estimator (e.g. it tends
+    to remove the low/negative-parallax tail). It is OFF by default; when you enable
+    it, watch the reported bias (median frac resid) before/after.
+
+    Returns (theta, res) with res.n_clipped and res.n_used added.
+    """
+    X = np.asarray(X, float); plx = np.asarray(plx, float); sigma = np.asarray(sigma, float)
+    N = X.shape[0]
+    keep = np.ones(N, bool)
+    theta, res = _gn_fit(X, plx, sigma, lam, maxiter, gtol, ftol)
+    if clip_sigma and clip_sigma > 0:
+        for _ in range(clip_rounds):
+            m = np.exp(np.clip(X @ theta, -30.0, 30.0))
+            chi = (plx - m) / sigma
+            c = np.median(chi[keep])
+            s = 1.48 * np.median(np.abs(chi[keep] - c))
+            if not (s > 0):
+                break
+            new_keep = keep & (np.abs(chi - c) <= clip_sigma * s)
+            if int(new_keep.sum()) == int(keep.sum()):
+                break                                  # converged: nothing new clipped
+            keep = new_keep
+            theta, res = _gn_fit(X[keep], plx[keep], sigma[keep], lam, maxiter, gtol, ftol)
+    res.n_clipped = int(N - keep.sum())
+    res.n_used = int(keep.sum())
+    return theta, res
+
+
 def predict(theta, stats, phot, spec, batch=50000):
     """exp(theta . x) in batches so we never standardize the whole 800k at once."""
     out = np.empty(len(phot))
@@ -348,7 +388,7 @@ def predict(theta, stats, phot, spec, batch=50000):
     return out
 
 
-def cv_fold_scatter(phot_tr, spec_tr, plx_tr, err_tr, fold_tr, lam, maxiter=2000):
+def cv_fold_scatter(phot_tr, spec_tr, plx_tr, err_tr, fold_tr, lam, clip_sigma=0.0):
     """Fit fold-A and fold-B at this lam, predict each fold with the OTHER fold's
     model, and return the honest cross-validated headline metric:
         (robust fractional scatter on the hi-S/N probe, (thA,stA), (thB,stB)).
@@ -358,9 +398,9 @@ def cv_fold_scatter(phot_tr, spec_tr, plx_tr, err_tr, fold_tr, lam, maxiter=2000
     import spphot_eval as E
     A, B = fold_tr == "A", fold_tr == "B"
     XA, stA = design(phot_tr[A], spec_tr[A])
-    thA, _ = fit_parallax_model(XA, plx_tr[A], err_tr[A], lam=lam, maxiter=maxiter)
+    thA, _ = fit_parallax_model(XA, plx_tr[A], err_tr[A], lam=lam, clip_sigma=clip_sigma)
     XB, stB = design(phot_tr[B], spec_tr[B])
-    thB, _ = fit_parallax_model(XB, plx_tr[B], err_tr[B], lam=lam, maxiter=maxiter)
+    thB, _ = fit_parallax_model(XB, plx_tr[B], err_tr[B], lam=lam, clip_sigma=clip_sigma)
     plx_sp = np.empty(len(plx_tr))
     plx_sp[A] = predict(thB, stB, phot_tr[A], spec_tr[A])   # A held out from B's fit
     plx_sp[B] = predict(thA, stA, phot_tr[B], spec_tr[B])   # B held out from A's fit
@@ -396,6 +436,7 @@ def save_model(path, *, theta_all, stats_all, theta_A, stats_A, theta_B, stats_B
         label_cols=np.array(LABEL_COLS),
         lam=np.float64(config["lam"]), f_max=np.float64(config["f_max"]),
         bad_frac=np.float64(config["bad_frac"]), snr_min=np.float64(config["snr_min"]),
+        clip_sigma=np.float64(config.get("clip_sigma", 0.0)),
         seed=np.int64(config["seed"]),
         **extra,
     )
@@ -436,6 +477,10 @@ def main():
                          "runs the full pipeline with it")
     ap.add_argument("--snr-min", type=float, default=100.0, help="training S/N cut")
     ap.add_argument("--bad-frac", type=float, default=0.01, help="shared good-pixel threshold")
+    ap.add_argument("--clip-sigma", type=float, default=0.0,
+                    help="iterative training-set sigma-clip on the parallax residual "
+                         "(0 = off; ~4 to enable). CAUTION: can bias the estimator — "
+                         "watch the reported bias")
     ap.add_argument("--batch-rows", type=int, default=20000)
     ap.add_argument("--pixel-mask-dir", default=None,
                     help="dir with per-telescope pixel_lit_mask_<tel>.npy; keeps only "
@@ -477,6 +522,9 @@ def main():
         sample[idx[rng.permutation(len(idx))[:len(idx) // 2]]] = "A"
     log(f"training stars: {train.sum()}  | negative plx kept: "
         f"{100*(plx_all[train] < 0).mean():.1f}%")
+    if args.clip_sigma > 0:
+        log(f"training-set sigma-clip ENABLED at {args.clip_sigma:g}sigma on the parallax "
+            f"residual (may bias the estimator — compare the bias line vs a clip-off run)")
 
     # ---- build spectra for every kept star (streaming) ----
     X_spec, good, star_bad = build_lnflux_streaming(
@@ -498,9 +546,11 @@ def main():
 
     def fit_on(mask, name, lam):
         Xf, st = design(phot_tr[mask], spec_tr[mask])
-        th, res = fit_parallax_model(Xf, plx_tr[mask], err_tr[mask], lam=lam)
+        th, res = fit_parallax_model(Xf, plx_tr[mask], err_tr[mask], lam=lam,
+                                     clip_sigma=args.clip_sigma)
+        clip_msg = f" clipped={res.n_clipped}/{mask.sum()}" if args.clip_sigma > 0 else ""
         log(f"  fit {name}: {mask.sum()} stars | lam={lam:g} converged={res.success} "
-            f"iters={res.nit} obj={res.fun:.4f}")
+            f"iters={res.nit} obj={res.fun:.4f}{clip_msg}")
         return th, st
 
     # ---- optional ridge scan: choose lam by cross-validated fold scatter ----
@@ -512,7 +562,8 @@ def main():
             f"(cross-validated robust fractional scatter on the hi-S/N probe) ...")
         scan = {}
         for lam in lams:
-            sc, fa, fb = cv_fold_scatter(phot_tr, spec_tr, plx_tr, err_tr, fold_tr, lam)
+            sc, fa, fb = cv_fold_scatter(phot_tr, spec_tr, plx_tr, err_tr, fold_tr, lam,
+                                         clip_sigma=args.clip_sigma)
             scan[lam] = (sc, fa, fb)
             log(f"  lam={lam:<8g} CV fold scatter = {100*sc:.2f}%")
         best_lam = min(scan, key=lambda L: scan[L][0])
@@ -572,7 +623,8 @@ def main():
                theta_A=theta_A, stats_A=stats_A, theta_B=theta_B, stats_B=stats_B,
                good=good, frac_sigma=frac_sigma, tel_masks=tel_masks,
                config={"lam": args.lam, "f_max": 2.0, "bad_frac": args.bad_frac,
-                       "snr_min": args.snr_min, "seed": args.seed})
+                       "snr_min": args.snr_min, "clip_sigma": args.clip_sigma,
+                       "seed": args.seed})
     log(f"wrote {args.out}  ({len(out)} stars)")
     log(f"saved model -> {model_out}")
 

@@ -46,22 +46,24 @@ LAM="${LAM:-0.1}"
 # or pass it semicolon-separated through -v (the script accepts , ; or space):
 #   qsub -v LAM_SCAN="0.003;0.01;0.03;0.1;0.3" run_full_gadi.pbs
 LAM_SCAN="${LAM_SCAN:-}"
+# optional training-set sigma-clip on the parallax residual (0 = off; ~4 to try).
+# CAUTION: can bias the estimator — compare the bias line against a clip-off run.
+#   qsub -v CLIP_SIGMA=4 run_full_gadi.pbs
+CLIP_SIGMA="${CLIP_SIGMA:-0}"
 BATCH_ROWS="${BATCH_ROWS:-20000}"
 # per-telescope pixel_lit_mask_<tel>.npy live here (keep only lit pixels)
 PIXEL_MASK_DIR="${PIXEL_MASK_DIR:-${SRC}/pixel_mask}"
 
-# threads: let BLAS (warm-start XtX) and JAX (refine) use the whole node
+# threads: the fit is now pure NumPy/BLAS (Gauss-Newton X^T diag(w) X per iteration),
+# so give BLAS the whole node — this is the genuinely multi-core part.
 export OMP_NUM_THREADS="${PBS_NCPUS:-48}"
 export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
 export OPENBLAS_NUM_THREADS="${OMP_NUM_THREADS}"
-export XLA_FLAGS="--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=${OMP_NUM_THREADS}"
-export JAX_ENABLE_X64=1
-export JAX_PLATFORMS=cpu          # this node has no GPU; skip the CUDA probe/warning
 
 mkdir -p "$(dirname "${OUT}")"
 echo "[pbs] host=$(hostname) ncpus=${PBS_NCPUS:-?} parquet=${PARQUET}"
 echo "[pbs] allstar=${ALLSTAR}"
-echo "[pbs] out=${OUT} lam=${LAM} lam_scan=${LAM_SCAN:-<none>} batch_rows=${BATCH_ROWS}"
+echo "[pbs] out=${OUT} lam=${LAM} lam_scan=${LAM_SCAN:-<none>} clip_sigma=${CLIP_SIGMA} batch_rows=${BATCH_ROWS}"
 echo "[pbs] pixel_mask_dir=${PIXEL_MASK_DIR}"
 
 ${PYTHON_BIN} run_full_gadi.py \
@@ -71,6 +73,7 @@ ${PYTHON_BIN} run_full_gadi.py \
     --lam     "${LAM}" \
     --batch-rows "${BATCH_ROWS}" \
     --pixel-mask-dir "${PIXEL_MASK_DIR}" \
+    --clip-sigma "${CLIP_SIGMA}" \
     ${LAM_SCAN:+--lam-scan "${LAM_SCAN}"}
 
 echo "[pbs] done -> ${OUT}"
