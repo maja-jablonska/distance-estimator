@@ -476,7 +476,8 @@ def main():
     # ---- optional ridge scan: choose lam by cross-validated fold scatter ----
     fold_models = None
     if args.lam_scan:
-        lams = [float(x) for x in args.lam_scan.split(",")]
+        import re
+        lams = [float(x) for x in re.split(r"[,;\s]+", args.lam_scan.strip()) if x]
         log(f"lambda scan over {lams} "
             f"(cross-validated robust fractional scatter on the hi-S/N probe) ...")
         scan = {}

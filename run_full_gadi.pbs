@@ -41,7 +41,10 @@ PARQUET="${PARQUET:-${DATA}/spectra_infer_parallax_zpt.parquet}"
 ALLSTAR="${ALLSTAR:-${DATA}/astraAllStarASPCAP-0.8.0.fits}"
 OUT="${OUT:-/scratch/mk27/${USER}/spphot_results_full.parquet}"
 LAM="${LAM:-0.1}"
-# optional ridge scan: qsub -v LAM_SCAN="0.003,0.01,0.03,0.1,0.3" run_full_gadi.pbs
+# optional ridge scan. qsub -v splits on commas, so either export it and use -V:
+#   export LAM_SCAN="0.003,0.01,0.03,0.1,0.3"; qsub -V run_full_gadi.pbs
+# or pass it semicolon-separated through -v (the script accepts , ; or space):
+#   qsub -v LAM_SCAN="0.003;0.01;0.03;0.1;0.3" run_full_gadi.pbs
 LAM_SCAN="${LAM_SCAN:-}"
 BATCH_ROWS="${BATCH_ROWS:-20000}"
 # per-telescope pixel_lit_mask_<tel>.npy live here (keep only lit pixels)
