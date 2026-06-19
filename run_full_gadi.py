@@ -42,6 +42,48 @@ def log(msg):
 
 
 # ----------------------------------------------------------------------
+# per-telescope "lit-anywhere" pixel masks (build_pixel_mask.py products)
+# ----------------------------------------------------------------------
+# A pixel is "lit" (True) when at least one spectrum from that telescope flagged
+# it; the never-lit pixels are chip gaps / no-coverage. We KEEP only lit pixels
+# (good_telescope = lit_mask) and intersect that, per star, with the existing
+# per-pixel data-quality bad detection (ivar==0 / continuum sanity). Telescopes
+# carry their own grid, so masks are stored one .npy per telescope.
+TELESCOPES = ("apo1m", "apo25m", "lco25m")
+
+
+def load_pixel_masks(mask_dir, telescopes=TELESCOPES):
+    """{telescope: bool lit-mask} from <mask_dir>/pixel_lit_mask_<tel>.npy.
+
+    Missing files are skipped (those telescopes get no extra masking). Returns
+    None if mask_dir is falsy, so the caller stays backward-compatible."""
+    if not mask_dir:
+        return None
+    masks = {}
+    for t in telescopes:
+        p = os.path.join(mask_dir, f"pixel_lit_mask_{t}.npy")
+        if os.path.exists(p):
+            m = np.load(p).astype(bool)
+            masks[t] = m
+            log(f"pixel mask {t}: keep {int(m.sum())}/{m.size} lit pixels ({p})")
+        else:
+            log(f"pixel mask {t}: MISSING ({p}) -> no telescope masking for {t}")
+    return masks or None
+
+
+def load_apogee_windows(path, width):
+    """HOOK (not yet wired in): build a (width,) bool mask that is True on the union
+    of the APOGEE element windows, to restrict the fit to spectral-line regions.
+
+    To enable: load the per-element window definitions (e.g. the apogee/aspcap line
+    list or the global_mask / element-window FITS) into a boolean array of length
+    `width`, then AND it into each telescope's lit mask in load_pixel_masks (so
+    `good_telescope = lit_mask & window_mask`). Left unimplemented on purpose — wire
+    it up once the window file path/format is settled."""
+    raise NotImplementedError("APOGEE element-window masking not wired up yet")
+
+
+# ----------------------------------------------------------------------
 # metadata: allStar FITS  +  parquet scalar columns, merged on sdss_id
 # ----------------------------------------------------------------------
 def load_metadata(parquet_path, allstar_path):
@@ -70,9 +112,16 @@ def load_metadata(parquet_path, allstar_path):
         log(f"allStar: collapsed {n_dup} duplicate sdss_id rows "
             f"-> {len(allstar)} unique stars")
 
-    log("reading parquet scalar columns (sdss_id, snr, spectrum_flags) ...")
-    meta = pq.read_table(parquet_path,
-                         columns=["sdss_id", "snr", "spectrum_flags"]).to_pandas()
+    log("reading parquet scalar columns (sdss_id, snr, spectrum_flags, zeropoint) ...")
+    avail = set(pq.ParquetFile(parquet_path).schema_arrow.names)
+    scalar_cols = ["sdss_id", "snr", "spectrum_flags"]
+    has_zpt = "zeropoint" in avail
+    if has_zpt:
+        scalar_cols.append("zeropoint")
+    meta = pq.read_table(parquet_path, columns=scalar_cols).to_pandas()
+    if not has_zpt:
+        meta["zeropoint"] = np.nan
+        log("parquet has no 'zeropoint' column -> parallax zero-point correction disabled")
     n_parquet = len(meta)
 
     # left join keeps parquet row order, so it stays aligned to the streamed spectra
@@ -94,14 +143,17 @@ def _list_col_2d(arr, width):
 
 
 def build_lnflux_streaming(parquet_path, keep_mask, f_max=2.0, bad_frac_max=0.01,
-                           batch_rows=20000, fixed_good=None):
+                           batch_rows=20000, fixed_good=None, tel_masks=None):
     """One streaming pass. Returns:
         X_spec    (n_keep, L) float32  ln(normalized flux) on shared good pixels
         good      (Lfull,)    bool     kept-pixel mask
         star_bad  (n_keep,)   float32  per-star bad-pixel fraction (data-quality flag)
     keep_mask is in PARQUET ROW ORDER (same order as load_metadata's merged frame).
     If fixed_good is given (a saved model's mask), it is used verbatim instead of
-    recomputing — so new spectra land on exactly the pixels the model was fit on."""
+    recomputing — so new spectra land on exactly the pixels the model was fit on.
+    If tel_masks (a {telescope: lit-mask} dict from load_pixel_masks) is given, a
+    pixel not lit by a star's telescope is treated as bad for that star (intersected
+    with the data-quality bad detection), so the feature only ever uses lit pixels."""
     import pyarrow.parquet as pq
 
     pf = pq.ParquetFile(parquet_path)
@@ -113,9 +165,14 @@ def build_lnflux_streaming(parquet_path, keep_mask, f_max=2.0, bad_frac_max=0.01
     out = 0          # next free row in the kept-output arrays
     row0 = 0         # running offset into the full parquet
     t0 = time.time()
+    unknown_tels = set()
+
+    columns = ["flux", "continuum", "ivar"]
+    if tel_masks is not None:
+        columns.append("telescope")
 
     for bi, batch in enumerate(pf.iter_batches(batch_size=batch_rows,
-                                               columns=["flux", "continuum", "ivar"])):
+                                               columns=columns)):
         bsz = batch.num_rows
         sel = keep_mask[row0:row0 + bsz]
         row0 += bsz
@@ -126,6 +183,10 @@ def build_lnflux_streaming(parquet_path, keep_mask, f_max=2.0, bad_frac_max=0.01
             width = batch.column("flux").values.to_numpy(zero_copy_only=False).size // bsz
             lnfull = np.zeros((n_keep, width), np.float32)
             bad_count = np.zeros(width, np.int64)
+            if tel_masks is not None:
+                for t, m in tel_masks.items():
+                    if m.size != width:
+                        raise ValueError(f"pixel mask {t} length {m.size} != grid {width}")
 
         flux = _list_col_2d(batch.column("flux"), width)[sel]
         cont = _list_col_2d(batch.column("continuum"), width)[sel]
@@ -135,15 +196,31 @@ def build_lnflux_streaming(parquet_path, keep_mask, f_max=2.0, bad_frac_max=0.01
         f = flux / C                                              # normalized flux
         bad = (~np.isfinite(f) | ~np.isfinite(ivar) | (ivar <= 0)
                | (cont <= 0) | (f <= 0) | (f > f_max))            # ivar==0 is APOGEE's mask sentinel
+        star_bad[out:out + k] = bad.mean(axis=1)                  # quality flag, telescope-independent
+
+        if tel_masks is not None:                                 # keep only telescope-lit pixels (AND)
+            tels = np.asarray(batch.column("telescope").to_pylist())[sel]
+            lit = np.ones((k, width), bool)
+            for t in np.unique(tels):
+                m = tel_masks.get(str(t))
+                if m is None:
+                    unknown_tels.add(str(t))
+                    continue                                      # unknown telescope -> no extra masking
+                lit[tels == t] = m
+            bad |= ~lit
+
         f = np.where(bad, 1.0, f)                                 # impute bad -> continuum (ln 0)
         lnfull[out:out + k] = np.log(f).astype(np.float32)
         bad_count += bad.sum(axis=0)
-        star_bad[out:out + k] = bad.mean(axis=1)
         out += k
 
         if bi % 20 == 0:
             log(f"  spectra: {out}/{n_keep} kept rows "
                 f"({(time.time()-t0):.0f}s)")
+
+    if unknown_tels:
+        log(f"WARNING: no pixel mask for telescopes {sorted(unknown_tels)} "
+            f"-> those spectra kept all data-quality-good pixels")
 
     assert out == n_keep, f"filled {out} rows, expected {n_keep}"
     if fixed_good is not None:
@@ -226,11 +303,17 @@ def predict(theta, stats, phot, spec, batch=50000):
 # model persistence — one self-contained, re-loadable artifact
 # ----------------------------------------------------------------------
 def save_model(path, *, theta_all, stats_all, theta_A, stats_A, theta_B, stats_B,
-               good, frac_sigma, config):
+               good, frac_sigma, config, tel_masks=None):
     """Everything needed to predict on NEW stars without refitting: the all-train
     model (theta + standardization), the good-pixel mask, the adopted fractional
     error, the feature order, and the build config. The fold models are kept too
-    so the A/B cross-validation is reproducible. Load with load_model()."""
+    so the A/B cross-validation is reproducible. The per-telescope pixel masks are
+    embedded so apply-time imputation matches training. Load with load_model()."""
+    extra = {}
+    if tel_masks:                                  # one array per telescope + the tag list
+        extra["tel_mask_tags"] = np.array(list(tel_masks))
+        for t, m in tel_masks.items():
+            extra[f"tel_mask_{t}"] = m
     np.savez_compressed(
         path,
         # primary (use this to predict new data)
@@ -244,6 +327,7 @@ def save_model(path, *, theta_all, stats_all, theta_A, stats_A, theta_B, stats_B
         lam=np.float64(config["lam"]), f_max=np.float64(config["f_max"]),
         bad_frac=np.float64(config["bad_frac"]), snr_min=np.float64(config["snr_min"]),
         seed=np.int64(config["seed"]),
+        **extra,
     )
 
 
@@ -251,6 +335,9 @@ def load_model(path):
     """Return a dict with theta_all, stats_all=(mu,sd), good_pixel_mask, frac_sigma,
     f_max, bad_frac, label_cols — the pieces apply_model.py needs."""
     z = np.load(path, allow_pickle=False)
+    tel_masks = None
+    if "tel_mask_tags" in z.files:
+        tel_masks = {str(t): z[f"tel_mask_{t}"].astype(bool) for t in z["tel_mask_tags"]}
     return {
         "theta_all": z["theta_all"], "stats_all": (z["mu_all"], z["sd_all"]),
         "theta_A": z["theta_A"], "stats_A": (z["mu_A"], z["sd_A"]),
@@ -258,6 +345,7 @@ def load_model(path):
         "good_pixel_mask": z["good_pixel_mask"], "frac_sigma": float(z["frac_sigma"]),
         "f_max": float(z["f_max"]), "bad_frac": float(z["bad_frac"]),
         "label_cols": [str(c) for c in z["label_cols"]],
+        "tel_masks": tel_masks,
     }
 
 
@@ -275,10 +363,14 @@ def main():
     ap.add_argument("--snr-min", type=float, default=100.0, help="training S/N cut")
     ap.add_argument("--bad-frac", type=float, default=0.01, help="shared good-pixel threshold")
     ap.add_argument("--batch-rows", type=int, default=20000)
+    ap.add_argument("--pixel-mask-dir", default=None,
+                    help="dir with per-telescope pixel_lit_mask_<tel>.npy; keeps only "
+                         "lit pixels (intersected with the data-quality mask)")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
     import pandas as pd
 
+    tel_masks = load_pixel_masks(args.pixel_mask_dir)
     merged, n_parquet = load_metadata(args.parquet, args.allstar)
 
     # ---- keep = complete photometry (we build spectra + predict for all of these) ----
@@ -287,10 +379,19 @@ def main():
     log(f"keep (complete photometry): {keep.sum()} / {n_parquet}")
 
     # ---- training set: quality cuts only; NO cut on parallax sign or S/N ----
-    plx_all = merged["plx"].to_numpy(float)
+    # apply the Gaia DR3 parallax zero-point: plx_corr = plx - zeropoint. The
+    # correction is undefined (NaN) for non-5/6-parameter sources -> plx_corr is
+    # NaN there, so the np.isfinite(plx_corr) cut drops them from training.
+    plx_raw = merged["plx"].to_numpy(float)
+    zpt_all = merged["zeropoint"].to_numpy(float)
+    plx_all = plx_raw - zpt_all
     err_all = merged["e_plx"].to_numpy(float)
     snr_ok  = merged["snr"].to_numpy(float)
     flags   = merged["spectrum_flags"].to_numpy()
+    n_zpt = int(np.isfinite(zpt_all).sum())
+    n_no_zpt = int((np.isfinite(plx_raw) & ~np.isfinite(zpt_all)).sum())
+    log(f"zero-point: applied to {n_zpt} sources; "
+        f"{n_no_zpt} stars have plx but no zeropoint (dropped from training)")
     train = (keep & (snr_ok > args.snr_min) & (flags == 0)
              & np.isfinite(plx_all) & np.isfinite(err_all) & (err_all > 0))
 
@@ -305,11 +406,13 @@ def main():
 
     # ---- build spectra for every kept star (streaming) ----
     X_spec, good, star_bad = build_lnflux_streaming(
-        args.parquet, keep, bad_frac_max=args.bad_frac, batch_rows=args.batch_rows)
+        args.parquet, keep, bad_frac_max=args.bad_frac, batch_rows=args.batch_rows,
+        tel_masks=tel_masks)
 
     # ---- restrict metadata to kept rows (same order as X_spec) ----
     phot_k = phot_all[keep]
-    plx_k, err_k = plx_all[keep], err_all[keep]
+    plx_k, err_k = plx_all[keep], err_all[keep]      # plx_k is zero-point corrected
+    plx_raw_k, zpt_k = plx_raw[keep], zpt_all[keep]
     samp_k = sample[keep]
     train_k = train[keep]
     ids_k = merged["sdss_id"].to_numpy()[keep]
@@ -354,7 +457,8 @@ def main():
     # ---- write results ----
     out = pd.DataFrame({
         "sdss_id": ids_k,
-        "plx": plx_k, "e_plx": err_k,
+        "plx": plx_k, "e_plx": err_k,            # plx is zero-point corrected (plx_raw - zeropoint)
+        "plx_raw": plx_raw_k, "zeropoint": zpt_k,
         "plx_sp": plx_sp, "err_sp": err_sp,
         "dist_sp_kpc": dist_kpc,
         "r_med_photogeo_pc": dist_bj_k,
@@ -367,7 +471,7 @@ def main():
     save_model(model_out,
                theta_all=theta_all, stats_all=stats_all,
                theta_A=theta_A, stats_A=stats_A, theta_B=theta_B, stats_B=stats_B,
-               good=good, frac_sigma=frac_sigma,
+               good=good, frac_sigma=frac_sigma, tel_masks=tel_masks,
                config={"lam": args.lam, "f_max": 2.0, "bad_frac": args.bad_frac,
                        "snr_min": args.snr_min, "seed": args.seed})
     log(f"wrote {args.out}  ({len(out)} stars)")

@@ -36,11 +36,14 @@ export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/py
 # data locations (the notebook's SRC = /home/100/mj8805/scr_mk27)
 SRC="${SRC:-/scratch/mk27/mj8805}"
 DATA="${DATA:-${SRC}/bulge-ages-and-orbits/data}"
-PARQUET="${PARQUET:-${DATA}/spectra_infer_parallax.parquet}"
+# the *_zpt parquet carries the Gaia parallax 'zeropoint' column (build_pixel_mask.py)
+PARQUET="${PARQUET:-${DATA}/spectra_infer_parallax_zpt.parquet}"
 ALLSTAR="${ALLSTAR:-${DATA}/astraAllStarASPCAP-0.8.0.fits}"
 OUT="${OUT:-/scratch/mk27/${USER}/spphot_results_full.parquet}"
 LAM="${LAM:-0.1}"
 BATCH_ROWS="${BATCH_ROWS:-20000}"
+# per-telescope pixel_lit_mask_<tel>.npy live here (keep only lit pixels)
+PIXEL_MASK_DIR="${PIXEL_MASK_DIR:-${SRC}/pixel_mask}"
 
 # threads: let BLAS (warm-start XtX) and JAX (refine) use the whole node
 export OMP_NUM_THREADS="${PBS_NCPUS:-48}"
@@ -54,12 +57,14 @@ mkdir -p "$(dirname "${OUT}")"
 echo "[pbs] host=$(hostname) ncpus=${PBS_NCPUS:-?} parquet=${PARQUET}"
 echo "[pbs] allstar=${ALLSTAR}"
 echo "[pbs] out=${OUT} lam=${LAM} batch_rows=${BATCH_ROWS}"
+echo "[pbs] pixel_mask_dir=${PIXEL_MASK_DIR}"
 
 ${PYTHON_BIN} run_full_gadi.py \
     --parquet "${PARQUET}" \
     --allstar "${ALLSTAR}" \
     --out     "${OUT}" \
     --lam     "${LAM}" \
-    --batch-rows "${BATCH_ROWS}"
+    --batch-rows "${BATCH_ROWS}" \
+    --pixel-mask-dir "${PIXEL_MASK_DIR}"
 
 echo "[pbs] done -> ${OUT}"

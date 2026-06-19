@@ -31,8 +31,9 @@ def main():
     import pandas as pd
 
     m = R.load_model(args.model)
+    n_tel = len(m["tel_masks"]) if m["tel_masks"] else 0
     R.log(f"loaded model: {m['good_pixel_mask'].sum()} good pixels, "
-          f"frac_sigma={100*m['frac_sigma']:.1f}%")
+          f"frac_sigma={100*m['frac_sigma']:.1f}%, telescope masks={n_tel}")
 
     merged, n_parquet = R.load_metadata(args.parquet, args.allstar)
 
@@ -40,10 +41,11 @@ def main():
     keep = np.isfinite(phot_all).all(axis=1)
     R.log(f"keep (complete photometry): {keep.sum()} / {n_parquet}")
 
-    # build spectra on the SAVED pixel mask (fixed_good), same normalization
+    # build spectra on the SAVED pixel mask (fixed_good) + per-telescope lit masks,
+    # same normalization and imputation as training
     X_spec, _, star_bad = R.build_lnflux_streaming(
         args.parquet, keep, f_max=m["f_max"], batch_rows=args.batch_rows,
-        fixed_good=m["good_pixel_mask"])
+        fixed_good=m["good_pixel_mask"], tel_masks=m["tel_masks"])
 
     phot_k = phot_all[keep]
     ids_k = merged["sdss_id"].to_numpy()[keep]
