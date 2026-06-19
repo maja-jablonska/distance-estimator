@@ -28,13 +28,6 @@ Usage (see run_full_gadi.pbs):
 """
 from __future__ import annotations
 import os, sys, time, argparse
-
-# The fit is small dense ridge + L-BFGS — run it on CPU. Forcing this before JAX is
-# imported avoids the GPU/CuDNN probe that crashes on a CuDNN runtime/compile version
-# mismatch (RET_CHECK failure ... dnn_support != nullptr). setdefault so an explicit
-# JAX_PLATFORMS in the environment still wins.
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -258,55 +251,92 @@ def design(phot, spec, stats=None):
     return np.hstack([np.ones((len(A), 1)), A]), stats
 
 
-def fit_parallax_model(X, plx, sigma, lam, maxiter=2000):
+def fit_parallax_model(X, plx, sigma, lam, maxiter=100, gtol=1e-7, ftol=1e-12):
     """theta for plx ~ exp(X @ theta): Gaussian-in-parallax NLL + L2 ridge.
-    Log-space ridge warm-start (positive parallaxes), then parallax-space refine."""
-    import jax
-    jax.config.update("jax_enable_x64", True)
-    import jax.numpy as jnp
-    from scipy.optimize import minimize
 
+    Log-space ridge warm-start (positive parallaxes), then a damped Gauss-Newton
+    (Levenberg-Marquardt) refine in parallax space. This is weighted nonlinear
+    least squares — residual (plx - m)/sigma with m = exp(X@theta) — and LM is the
+    natural, curvature-scaled method for it. It is immune to the line-search stall
+    that left the old L-BFGS refine at iters=1 with a large gradient (the tiny Gaia
+    sigmas make the objective very stiff). The GN normal-equation matrix reuses the
+    same X^T (weighted) X solve as the warm-start.
+
+    Objective F = 0.5/N * sum((plx-m)^2/sigma^2) + 0.5 * sum(reg*theta^2), reg[0]=0.
+    Gradient   g = 1/N * X^T (m(m-plx)/sigma^2) + reg*theta.
+    GN Hessian H = 1/N * X^T diag(m^2/sigma^2) X + diag(reg)  (drops the term in
+                   (plx-m), which vanishes at the optimum -> the GN approximation).
+
+    Returns (theta, res) with res.x .success .nit .fun .jac (final gradient).
+    """
+    from types import SimpleNamespace
     X = np.asarray(X, float); plx = np.asarray(plx, float); sigma = np.asarray(sigma, float)
     N, D = X.shape
-    reg = np.full(D, lam); reg[0] = 0.0
+    reg = np.full(D, lam); reg[0] = 0.0          # no ridge on the intercept
+    invN = 1.0 / N
+    inv_s2 = 1.0 / sigma ** 2
 
+    # --- warm start: log-space ridge on positive parallaxes ---
     pos = plx > 0
     Xw, yw = X[pos], np.log(plx[pos])
     try:
-        theta0 = np.linalg.solve(Xw.T @ Xw + np.diag(reg) * pos.sum(), Xw.T @ yw)
+        theta = np.linalg.solve(Xw.T @ Xw + np.diag(reg) * pos.sum(), Xw.T @ yw)
     except np.linalg.LinAlgError:
-        theta0 = np.zeros(D); theta0[0] = np.log(np.median(plx[pos]))
+        theta = np.zeros(D); theta[0] = np.log(np.median(plx[pos]))
 
-    Xj, yj, sj, regj = (jnp.asarray(np.asarray(v, float)) for v in (X, plx, sigma, reg))
-    invN = 1.0 / N
+    def objective(th):
+        m = np.exp(np.clip(X @ th, -30.0, 30.0))
+        r = (plx - m) / sigma
+        f = 0.5 * invN * float(r @ r) + 0.5 * float(reg @ (th * th))
+        return f, m
 
-    # pass the data as traced args (not closed-over) so XLA does NOT bake the full
-    # design matrix into the compiled fn as a multi-GB constant; it stays a device
-    # buffer compiled once and reused every L-BFGS step.
-    @jax.jit
-    def value_and_grad(theta, Xj, yj, sj, regj):
-        def obj(th):
-            m = jnp.exp(jnp.clip(Xj @ th, -30, 30))
-            r = (yj - m) / sj
-            return 0.5 * invN * jnp.sum(r ** 2) + 0.5 * jnp.sum(regj * th ** 2)
-        return jax.value_and_grad(obj)(theta)
+    f, m = objective(theta)
+    mu = 1e-3                                     # LM damping
+    converged = False
+    nit = 0
+    gnorm = np.inf
+    diag_idx = np.diag_indices(D)
+    for nit in range(1, maxiter + 1):
+        g = invN * (X.T @ (m * (m - plx) * inv_s2)) + reg * theta     # exact gradient
+        gnorm = float(np.max(np.abs(g)))
+        if gnorm < gtol:
+            converged = True
+            break
 
-    def scipy_obj(theta):
-        fv, g = value_and_grad(jnp.asarray(theta), Xj, yj, sj, regj)
-        return float(fv), np.asarray(g, np.float64)
+        w = (m * m) * inv_s2                                          # GN weights
+        H = invN * (X.T @ (X * w[:, None]))                           # 1/N X^T diag(w) X
+        diagA = H[diag_idx] + reg                                     # diagonal of H+reg, for LM scaling
 
-    # The objective is mean-scaled (1/N), so its gradient is ~1/N smaller than the
-    # raw sum. L-BFGS-B's default pgtol=1e-5 is then met after a single step on big
-    # N (it "converges" at iters=1 without actually refining). Tighten gtol/ftol so
-    # the parallax-space refine genuinely runs to a stationary point.
-    res = minimize(scipy_obj, theta0, jac=True, method="L-BFGS-B",
-                   options={"maxiter": maxiter, "maxfun": 4 * maxiter,
-                            "gtol": 1e-9, "ftol": 1e-12})
-    gnorm = float(np.max(np.abs(res.jac))) if res.jac is not None else float("nan")
-    if res.nit <= 1:
-        log(f"  WARNING: fit stopped at iters={res.nit} (|grad|inf={gnorm:.2e}); "
-            f"refine may not have run — check tolerances")
-    return res.x, res
+        # LM damping search: grow mu until the step actually decreases F
+        accepted = False
+        rel = np.inf
+        for _ in range(40):
+            A = H.copy()
+            A[diag_idx] += reg + mu * diagA                           # ridge + Marquardt damping
+            try:
+                delta = np.linalg.solve(A, -g)
+            except np.linalg.LinAlgError:
+                mu *= 10.0
+                continue
+            f_new, m_new = objective(theta + delta)
+            if f_new < f:
+                rel = (f - f_new) / max(abs(f), 1.0)
+                theta = theta + delta; f = f_new; m = m_new
+                mu = max(mu / 3.0, 1e-12)
+                accepted = True
+                break
+            mu *= 3.0
+        if not accepted:                          # damping maxed: no improving step -> minimum
+            converged = True
+            break
+        if rel < ftol:                            # negligible objective reduction
+            converged = True
+            break
+
+    res = SimpleNamespace(x=theta, success=converged, nit=nit, fun=f, jac=g)
+    if not converged:
+        log(f"  WARNING: GN refine hit maxiter={maxiter} (|grad|inf={gnorm:.2e})")
+    return theta, res
 
 
 def predict(theta, stats, phot, spec, batch=50000):
