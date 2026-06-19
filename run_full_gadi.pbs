@@ -41,6 +41,8 @@ PARQUET="${PARQUET:-${DATA}/spectra_infer_parallax_zpt.parquet}"
 ALLSTAR="${ALLSTAR:-${DATA}/astraAllStarASPCAP-0.8.0.fits}"
 OUT="${OUT:-/scratch/mk27/${USER}/spphot_results_full.parquet}"
 LAM="${LAM:-0.1}"
+# optional ridge scan: qsub -v LAM_SCAN="0.003,0.01,0.03,0.1,0.3" run_full_gadi.pbs
+LAM_SCAN="${LAM_SCAN:-}"
 BATCH_ROWS="${BATCH_ROWS:-20000}"
 # per-telescope pixel_lit_mask_<tel>.npy live here (keep only lit pixels)
 PIXEL_MASK_DIR="${PIXEL_MASK_DIR:-${SRC}/pixel_mask}"
@@ -56,7 +58,7 @@ export JAX_PLATFORMS=cpu          # this node has no GPU; skip the CUDA probe/wa
 mkdir -p "$(dirname "${OUT}")"
 echo "[pbs] host=$(hostname) ncpus=${PBS_NCPUS:-?} parquet=${PARQUET}"
 echo "[pbs] allstar=${ALLSTAR}"
-echo "[pbs] out=${OUT} lam=${LAM} batch_rows=${BATCH_ROWS}"
+echo "[pbs] out=${OUT} lam=${LAM} lam_scan=${LAM_SCAN:-<none>} batch_rows=${BATCH_ROWS}"
 echo "[pbs] pixel_mask_dir=${PIXEL_MASK_DIR}"
 
 ${PYTHON_BIN} run_full_gadi.py \
@@ -65,6 +67,7 @@ ${PYTHON_BIN} run_full_gadi.py \
     --out     "${OUT}" \
     --lam     "${LAM}" \
     --batch-rows "${BATCH_ROWS}" \
-    --pixel-mask-dir "${PIXEL_MASK_DIR}"
+    --pixel-mask-dir "${PIXEL_MASK_DIR}" \
+    ${LAM_SCAN:+--lam-scan "${LAM_SCAN}"}
 
 echo "[pbs] done -> ${OUT}"

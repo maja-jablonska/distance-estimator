@@ -295,8 +295,17 @@ def fit_parallax_model(X, plx, sigma, lam, maxiter=2000):
         fv, g = value_and_grad(jnp.asarray(theta), Xj, yj, sj, regj)
         return float(fv), np.asarray(g, np.float64)
 
+    # The objective is mean-scaled (1/N), so its gradient is ~1/N smaller than the
+    # raw sum. L-BFGS-B's default pgtol=1e-5 is then met after a single step on big
+    # N (it "converges" at iters=1 without actually refining). Tighten gtol/ftol so
+    # the parallax-space refine genuinely runs to a stationary point.
     res = minimize(scipy_obj, theta0, jac=True, method="L-BFGS-B",
-                   options={"maxiter": maxiter, "maxfun": 4 * maxiter})
+                   options={"maxiter": maxiter, "maxfun": 4 * maxiter,
+                            "gtol": 1e-9, "ftol": 1e-12})
+    gnorm = float(np.max(np.abs(res.jac))) if res.jac is not None else float("nan")
+    if res.nit <= 1:
+        log(f"  WARNING: fit stopped at iters={res.nit} (|grad|inf={gnorm:.2e}); "
+            f"refine may not have run — check tolerances")
     return res.x, res
 
 
@@ -307,6 +316,27 @@ def predict(theta, stats, phot, spec, batch=50000):
         Xb, _ = design(phot[i:i + batch], spec[i:i + batch], stats)
         out[i:i + batch] = np.exp(np.clip(Xb @ theta, -30, 30))
     return out
+
+
+def cv_fold_scatter(phot_tr, spec_tr, plx_tr, err_tr, fold_tr, lam, maxiter=2000):
+    """Fit fold-A and fold-B at this lam, predict each fold with the OTHER fold's
+    model, and return the honest cross-validated headline metric:
+        (robust fractional scatter on the hi-S/N probe, (thA,stA), (thB,stB)).
+    This is exactly the number print_report calls SCATTER, so it is the right
+    quantity to choose lam on. The fold models are returned so the caller can
+    reuse the winning lam's fits without refitting them."""
+    import spphot_eval as E
+    A, B = fold_tr == "A", fold_tr == "B"
+    XA, stA = design(phot_tr[A], spec_tr[A])
+    thA, _ = fit_parallax_model(XA, plx_tr[A], err_tr[A], lam=lam, maxiter=maxiter)
+    XB, stB = design(phot_tr[B], spec_tr[B])
+    thB, _ = fit_parallax_model(XB, plx_tr[B], err_tr[B], lam=lam, maxiter=maxiter)
+    plx_sp = np.empty(len(plx_tr))
+    plx_sp[A] = predict(thB, stB, phot_tr[A], spec_tr[A])   # A held out from B's fit
+    plx_sp[B] = predict(thA, stA, phot_tr[B], spec_tr[B])   # B held out from A's fit
+    probe = np.isfinite(plx_tr) & (plx_tr > 0) & (plx_tr / err_tr >= 20.0)
+    scatter = E.robust_scatter(E.fractional_residuals(plx_sp[probe], plx_tr[probe]))
+    return scatter, (thA, stA), (thB, stB)
 
 
 # ----------------------------------------------------------------------
@@ -370,6 +400,10 @@ def main():
     ap.add_argument("--model-out", default=None,
                     help="path for the saved model npz (default: <out>_model.npz)")
     ap.add_argument("--lam", type=float, default=0.1, help="ridge strength")
+    ap.add_argument("--lam-scan", default=None,
+                    help="comma-separated ridge values to scan, e.g. '0.003,0.01,0.03,0.1,0.3'; "
+                         "picks the lam with the lowest cross-validated fold scatter, then "
+                         "runs the full pipeline with it")
     ap.add_argument("--snr-min", type=float, default=100.0, help="training S/N cut")
     ap.add_argument("--bad-frac", type=float, default=0.01, help="shared good-pixel threshold")
     ap.add_argument("--batch-rows", type=int, default=20000)
@@ -432,17 +466,41 @@ def main():
     phot_tr, spec_tr = phot_k[train_k], X_spec[train_k]
     plx_tr, err_tr, fold_tr = plx_k[train_k], err_k[train_k], samp_k[train_k]
 
-    def fit_on(mask, name):
+    def fit_on(mask, name, lam):
         Xf, st = design(phot_tr[mask], spec_tr[mask])
-        th, res = fit_parallax_model(Xf, plx_tr[mask], err_tr[mask], lam=args.lam)
-        log(f"  fit {name}: {mask.sum()} stars | converged={res.success} "
+        th, res = fit_parallax_model(Xf, plx_tr[mask], err_tr[mask], lam=lam)
+        log(f"  fit {name}: {mask.sum()} stars | lam={lam:g} converged={res.success} "
             f"iters={res.nit} obj={res.fun:.4f}")
         return th, st
 
+    # ---- optional ridge scan: choose lam by cross-validated fold scatter ----
+    fold_models = None
+    if args.lam_scan:
+        lams = [float(x) for x in args.lam_scan.split(",")]
+        log(f"lambda scan over {lams} "
+            f"(cross-validated robust fractional scatter on the hi-S/N probe) ...")
+        scan = {}
+        for lam in lams:
+            sc, fa, fb = cv_fold_scatter(phot_tr, spec_tr, plx_tr, err_tr, fold_tr, lam)
+            scan[lam] = (sc, fa, fb)
+            log(f"  lam={lam:<8g} CV fold scatter = {100*sc:.2f}%")
+        best_lam = min(scan, key=lambda L: scan[L][0])
+        log("  --- lambda scan summary (lower is better) ---")
+        for lam in lams:
+            mark = "   <-- selected" if lam == best_lam else ""
+            log(f"    lam={lam:<8g} {100*scan[lam][0]:.2f}%{mark}")
+        args.lam = best_lam
+        _, (theta_A, stats_A), (theta_B, stats_B) = scan[best_lam]   # reuse winning fits
+        fold_models = (theta_A, stats_A, theta_B, stats_B)
+
     log("fitting models ...")
-    theta_A, stats_A = fit_on(fold_tr == "A", "fold-A")
-    theta_B, stats_B = fit_on(fold_tr == "B", "fold-B")
-    theta_all, stats_all = fit_on(np.ones(len(plx_tr), bool), "all-train")
+    if fold_models is not None:
+        theta_A, stats_A, theta_B, stats_B = fold_models      # already fit at best lam
+        log(f"  reusing fold-A/B fits from the lambda scan (lam={args.lam:g})")
+    else:
+        theta_A, stats_A = fit_on(fold_tr == "A", "fold-A", args.lam)
+        theta_B, stats_B = fit_on(fold_tr == "B", "fold-B", args.lam)
+    theta_all, stats_all = fit_on(np.ones(len(plx_tr), bool), "all-train", args.lam)
 
     # ---- predict every kept star ----
     log("predicting spec parallaxes ...")
