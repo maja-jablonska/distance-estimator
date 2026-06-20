@@ -83,6 +83,20 @@ def het_nll(z_mu, z_logs, plx, err):
     return 0.5 * ((plx - m) ** 2 / var + torch.log(var)).mean()
 
 
+def studentt_nll(z_mu, z_logs, plx, err, nu):
+    """Heteroscedastic Student-t NLL: same per-star (plx_sp, sig_sp) heads, but the
+    residual is modelled as Student-t with squared scale sig_sp^2 + e_plx^2 and nu
+    degrees of freedom. The fat tails downweight outliers during training (a binary
+    contributes ~log of its residual instead of its square), so the fit and the
+    per-star scale are not dragged by the tail. sig_sp here is the t SCALE; its
+    standard deviation is sig_sp * sqrt(nu/(nu-2)) (applied at output time)."""
+    m, sig = _mu_sig(z_mu, z_logs)
+    s2 = sig * sig + err * err
+    r2 = (plx - m) ** 2 / s2
+    c = math.lgamma(nu / 2.0) - math.lgamma((nu + 1.0) / 2.0) + 0.5 * math.log(nu * math.pi)
+    return (c + 0.5 * torch.log(s2) + 0.5 * (nu + 1.0) * torch.log1p(r2 / nu)).mean()
+
+
 # ----------------------------------------------------------------------
 # standardize [phot | spec] with train-fold statistics
 # ----------------------------------------------------------------------
@@ -96,7 +110,7 @@ def standardize_fit(A):
 # ----------------------------------------------------------------------
 # train / predict
 # ----------------------------------------------------------------------
-def train_fold(feats, train_mask, plx, err, mu, sd, *, hidden, dropout, lr,
+def train_fold(feats, train_mask, plx, err, mu, sd, *, loss_fn, hidden, dropout, lr,
                weight_decay, epochs, batch_size, device, seed, label):
     """Train a HetMLP on the stars in train_mask. Features are standardized per batch
     with the supplied (mu, sd) — the train-fold stats — so nothing leaks from the
@@ -135,7 +149,7 @@ def train_fold(feats, train_mask, plx, err, mu, sd, *, hidden, dropout, lr,
             yb = plx_t[bidx].to(device)
             eb = err_t[bidx].to(device)
             z_mu, z_logs = model(xb)
-            loss = het_nll(z_mu, z_logs, yb, eb)
+            loss = loss_fn(z_mu, z_logs, yb, eb)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -191,8 +205,25 @@ def main():
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--batch-size", type=int, default=4096)
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    ap.add_argument("--loss", default="gauss", choices=["gauss", "studentt"],
+                    help="likelihood: gauss (heteroscedastic Gaussian) or studentt "
+                         "(fat-tailed, robust to outliers during training)")
+    ap.add_argument("--nu", type=float, default=4.0,
+                    help="Student-t degrees of freedom (only used with --loss studentt; "
+                         "smaller = heavier tails / more robust)")
     args = ap.parse_args()
     import pandas as pd
+
+    # likelihood + the factor turning the t SCALE into a 1-sigma std for the eval/output
+    if args.loss == "studentt":
+        nu = args.nu
+        loss_fn = lambda zmu, zls, y, e: studentt_nll(zmu, zls, y, e, nu)
+        std_factor = math.sqrt(nu / (nu - 2.0)) if nu > 2.0 else 1.0
+        log(f"loss=studentt (nu={nu:g}); err_sp = scale * {std_factor:.3f}")
+    else:
+        loss_fn = het_nll
+        std_factor = 1.0
+        log("loss=gauss (heteroscedastic Gaussian)")
 
     device = args.device
     if device == "auto":
@@ -219,7 +250,7 @@ def main():
     B = train_k & (samp_k == "B")
     rest = ~train_k
 
-    hp = dict(hidden=hidden, dropout=args.dropout, lr=args.lr,
+    hp = dict(loss_fn=loss_fn, hidden=hidden, dropout=args.dropout, lr=args.lr,
               weight_decay=args.weight_decay, epochs=args.epochs,
               batch_size=args.batch_size, device=device, seed=args.seed)
 
@@ -245,7 +276,9 @@ def main():
     ):
         idx = np.where(mask)[0]
         if idx.size:
-            plx_sp[idx], err_sp[idx] = predict_nn(model, feats, idx, mu, sd, device)
+            m_i, s_i = predict_nn(model, feats, idx, mu, sd, device)
+            plx_sp[idx] = m_i
+            err_sp[idx] = s_i * std_factor      # t scale -> 1-sigma std (1.0 for gauss)
 
     dist_kpc = 1.0 / plx_sp
 
@@ -269,21 +302,23 @@ def main():
         "hidden": list(hidden), "dropout": args.dropout,
         "label_cols": list(R.LABEL_COLS), "d_in": int(feats.shape[1]),
         "snr_min": args.snr_min, "bad_frac": args.bad_frac, "seed": args.seed,
+        "loss": args.loss, "nu": args.nu, "std_factor": std_factor,
     }, model_out)
     log(f"wrote {args.out}  ({len(plx_k)} stars)")
     log(f"saved model -> {model_out}")
 
     # ---- cross-validated eval report (same metrics as the linear baseline) ----
     import spphot_eval as E
+    label = f"het-NN ({args.loss})"
     cat = {"plx_a": plx_k[train_k], "err_a": err_k[train_k],
            "plx_sp": plx_sp[train_k], "err_sp": err_sp[train_k],
            "train": np.ones(int(train_k.sum()), bool), "sample": samp_k[train_k],
            "id": ids_k[train_k]}
     print()
-    E.print_report(E.evaluate(cat, label="heteroscedastic NN"))
+    E.print_report(E.evaluate(cat, label=label))
     print()
     for f in ("A", "B"):
-        E.print_report(E.evaluate(cat, fold=f, label="heteroscedastic NN"))
+        E.print_report(E.evaluate(cat, fold=f, label=label))
         print()
 
 

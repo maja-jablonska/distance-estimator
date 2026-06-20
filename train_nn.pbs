@@ -46,6 +46,10 @@ LR="${LR:-1e-3}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
 DROPOUT="${DROPOUT:-0.1}"
 DEVICE="${DEVICE:-auto}"
+# likelihood: gauss (default) or studentt (robust). Run the robust variant separately:
+#   qsub -v LOSS=studentt,OUT=/scratch/mk27/$USER/spphot_nn_studentt.parquet train_nn.pbs
+LOSS="${LOSS:-gauss}"
+NU="${NU:-4}"
 
 # torch CPU threads (no-op on GPU)
 export OMP_NUM_THREADS="${PBS_NCPUS:-48}"
@@ -53,7 +57,7 @@ export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
 
 mkdir -p "$(dirname "${OUT}")"
 echo "[pbs] host=$(hostname) ncpus=${PBS_NCPUS:-?} parquet=${PARQUET}"
-echo "[pbs] out=${OUT} hidden=${HIDDEN} epochs=${EPOCHS} batch=${BATCH_SIZE} device=${DEVICE}"
+echo "[pbs] out=${OUT} hidden=${HIDDEN} epochs=${EPOCHS} batch=${BATCH_SIZE} device=${DEVICE} loss=${LOSS} nu=${NU}"
 echo "[pbs] pixel_mask_dir=${PIXEL_MASK_DIR}"
 
 ${PYTHON_BIN} train_nn.py \
@@ -68,6 +72,8 @@ ${PYTHON_BIN} train_nn.py \
     --lr "${LR}" \
     --weight-decay "${WEIGHT_DECAY}" \
     --dropout "${DROPOUT}" \
-    --device "${DEVICE}"
+    --device "${DEVICE}" \
+    --loss "${LOSS}" \
+    --nu "${NU}"
 
 echo "[pbs] done -> ${OUT}"
