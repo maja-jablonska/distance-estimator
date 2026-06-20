@@ -468,6 +468,68 @@ def load_model(path):
 
 
 # ----------------------------------------------------------------------
+# sample assembly — shared by the linear fit and the NN workflow
+# ----------------------------------------------------------------------
+def prepare_sample(parquet, allstar, *, snr_min=100.0, bad_frac=0.01,
+                   batch_rows=20000, pixel_mask_dir=None, seed=42):
+    """Load + assemble the modelling sample once, so every model (linear or NN) is
+    trained and scored on identical features/targets/splits: allStar+parquet
+    metadata, the Gaia parallax zero-point (plx_corr = plx - zeropoint), the
+    per-telescope lit-pixel masks, the quality-cut training set (no parallax/S-N
+    cut), a reproducible A/B split, and the streamed ln-flux matrix.
+
+    Returns a dict of kept-row arrays (parquet row order, restricted to stars with
+    complete photometry):
+        phot (n,8)  spec (n,L)  plx err  plx_raw zeropoint  sample('A'/'B')
+        train(bool)  ids  dist_bj  star_bad   plus good(Lfull,), tel_masks, n_parquet
+    """
+    tel_masks = load_pixel_masks(pixel_mask_dir)
+    merged, n_parquet = load_metadata(parquet, allstar)
+
+    phot_all = merged[LABEL_COLS].to_numpy(float)
+    keep = np.isfinite(phot_all).all(axis=1)
+    log(f"keep (complete photometry): {keep.sum()} / {n_parquet}")
+
+    # zero-point: plx_corr = plx - zeropoint (NaN for non-5/6-param sources -> the
+    # isfinite(plx_corr) cut below drops them from training)
+    plx_raw = merged["plx"].to_numpy(float)
+    zpt_all = merged["zeropoint"].to_numpy(float)
+    plx_all = plx_raw - zpt_all
+    err_all = merged["e_plx"].to_numpy(float)
+    snr_ok  = merged["snr"].to_numpy(float)
+    flags   = merged["spectrum_flags"].to_numpy()
+    n_zpt = int(np.isfinite(zpt_all).sum())
+    n_no_zpt = int((np.isfinite(plx_raw) & ~np.isfinite(zpt_all)).sum())
+    log(f"zero-point: applied to {n_zpt} sources; "
+        f"{n_no_zpt} stars have plx but no zeropoint (dropped from training)")
+    train = (keep & (snr_ok > snr_min) & (flags == 0)
+             & np.isfinite(plx_all) & np.isfinite(err_all) & (err_all > 0))
+
+    # reproducible 50/50 A/B split, stratified on train / non-train
+    rng = np.random.default_rng(seed)
+    sample = np.full(n_parquet, "B")
+    for mask in (train, keep & ~train):
+        idx = np.where(mask)[0]
+        sample[idx[rng.permutation(len(idx))[:len(idx) // 2]]] = "A"
+    log(f"training stars: {train.sum()}  | negative plx kept: "
+        f"{100*(plx_all[train] < 0).mean():.1f}%")
+
+    X_spec, good, star_bad = build_lnflux_streaming(
+        parquet, keep, bad_frac_max=bad_frac, batch_rows=batch_rows, tel_masks=tel_masks)
+
+    return {
+        "phot": phot_all[keep], "spec": X_spec,
+        "plx": plx_all[keep], "err": err_all[keep],
+        "plx_raw": plx_raw[keep], "zeropoint": zpt_all[keep],
+        "sample": sample[keep], "train": train[keep],
+        "ids": merged["sdss_id"].to_numpy()[keep],
+        "dist_bj": merged["r_med_photogeo"].to_numpy(float)[keep],
+        "star_bad": star_bad, "good": good, "tel_masks": tel_masks,
+        "n_parquet": n_parquet,
+    }
+
+
+# ----------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------
 def main():
@@ -497,56 +559,18 @@ def main():
     args = ap.parse_args()
     import pandas as pd
 
-    tel_masks = load_pixel_masks(args.pixel_mask_dir)
-    merged, n_parquet = load_metadata(args.parquet, args.allstar)
-
-    # ---- keep = complete photometry (we build spectra + predict for all of these) ----
-    phot_all = merged[LABEL_COLS].to_numpy(float)
-    keep = np.isfinite(phot_all).all(axis=1)
-    log(f"keep (complete photometry): {keep.sum()} / {n_parquet}")
-
-    # ---- training set: quality cuts only; NO cut on parallax sign or S/N ----
-    # apply the Gaia DR3 parallax zero-point: plx_corr = plx - zeropoint. The
-    # correction is undefined (NaN) for non-5/6-parameter sources -> plx_corr is
-    # NaN there, so the np.isfinite(plx_corr) cut drops them from training.
-    plx_raw = merged["plx"].to_numpy(float)
-    zpt_all = merged["zeropoint"].to_numpy(float)
-    plx_all = plx_raw - zpt_all
-    err_all = merged["e_plx"].to_numpy(float)
-    snr_ok  = merged["snr"].to_numpy(float)
-    flags   = merged["spectrum_flags"].to_numpy()
-    n_zpt = int(np.isfinite(zpt_all).sum())
-    n_no_zpt = int((np.isfinite(plx_raw) & ~np.isfinite(zpt_all)).sum())
-    log(f"zero-point: applied to {n_zpt} sources; "
-        f"{n_no_zpt} stars have plx but no zeropoint (dropped from training)")
-    train = (keep & (snr_ok > args.snr_min) & (flags == 0)
-             & np.isfinite(plx_all) & np.isfinite(err_all) & (err_all > 0))
-
-    # ---- reproducible 50/50 A/B split, stratified on train / non-train ----
-    rng = np.random.default_rng(args.seed)
-    sample = np.full(n_parquet, "B")
-    for mask in (train, keep & ~train):
-        idx = np.where(mask)[0]
-        sample[idx[rng.permutation(len(idx))[:len(idx) // 2]]] = "A"
-    log(f"training stars: {train.sum()}  | negative plx kept: "
-        f"{100*(plx_all[train] < 0).mean():.1f}%")
+    S = prepare_sample(args.parquet, args.allstar, snr_min=args.snr_min,
+                       bad_frac=args.bad_frac, batch_rows=args.batch_rows,
+                       pixel_mask_dir=args.pixel_mask_dir, seed=args.seed)
+    phot_k, X_spec = S["phot"], S["spec"]
+    plx_k, err_k = S["plx"], S["err"]                 # plx_k is zero-point corrected
+    plx_raw_k, zpt_k = S["plx_raw"], S["zeropoint"]
+    samp_k, train_k = S["sample"], S["train"]
+    ids_k, dist_bj_k = S["ids"], S["dist_bj"]
+    star_bad, good, tel_masks = S["star_bad"], S["good"], S["tel_masks"]
     if args.clip_sigma > 0:
         log(f"training-set sigma-clip ENABLED at {args.clip_sigma:g}sigma on the parallax "
             f"residual (may bias the estimator — compare the bias line vs a clip-off run)")
-
-    # ---- build spectra for every kept star (streaming) ----
-    X_spec, good, star_bad = build_lnflux_streaming(
-        args.parquet, keep, bad_frac_max=args.bad_frac, batch_rows=args.batch_rows,
-        tel_masks=tel_masks)
-
-    # ---- restrict metadata to kept rows (same order as X_spec) ----
-    phot_k = phot_all[keep]
-    plx_k, err_k = plx_all[keep], err_all[keep]      # plx_k is zero-point corrected
-    plx_raw_k, zpt_k = plx_raw[keep], zpt_all[keep]
-    samp_k = sample[keep]
-    train_k = train[keep]
-    ids_k = merged["sdss_id"].to_numpy()[keep]
-    dist_bj_k = merged["r_med_photogeo"].to_numpy(float)[keep]
 
     # ---- fit three models on the training subset ----
     phot_tr, spec_tr = phot_k[train_k], X_spec[train_k]
@@ -594,7 +618,7 @@ def main():
 
     # ---- predict every kept star ----
     log("predicting spec parallaxes ...")
-    plx_sp = np.empty(keep.sum())
+    plx_sp = np.empty(len(plx_k))
     A_tr = train_k & (samp_k == "A")          # training, fold A -> predicted by B
     B_tr = train_k & (samp_k == "B")          # training, fold B -> predicted by A
     rest = ~train_k                           # non-training -> all-train model

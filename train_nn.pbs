@@ -1,0 +1,73 @@
+#!/bin/bash
+#PBS -N spphot_nn
+#PBS -P mk27
+#PBS -q rsaa
+#PBS -l ncpus=104
+#PBS -l mem=190GB
+#PBS -l walltime=08:00:00
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
+#PBS -l wd
+#PBS -j oe
+#PBS -m abe
+#PBS -M maja.jablonska@anu.edu.au
+
+# --------------------------------------------------------------------------
+# Heteroscedastic-NN spectrophotometric parallax (~800k stars) — train_nn.py
+#
+# Reuses run_full_gadi.prepare_sample, so it trains on the SAME features, zero-point,
+# pixel masks and A/B split as the linear baseline — only the model differs (an MLP
+# that predicts a parallax AND a per-star error). Scored by the same spphot_eval.
+#
+# CPU node (rsaa) by default: torch uses all cores. If you have a GPU queue, switch
+# the header to it (e.g. -q gpuvolta -l ngpus=1) and the script auto-detects cuda.
+#
+# Submit:
+#   qsub train_nn.pbs
+#   qsub -v EPOCHS=100,HIDDEN="2048,1024,512" train_nn.pbs
+# --------------------------------------------------------------------------
+
+set -euo pipefail
+
+export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}"
+
+SRC="${SRC:-/scratch/mk27/mj8805}"
+DATA="${DATA:-${SRC}/bulge-ages-and-orbits/data}"
+PARQUET="${PARQUET:-${DATA}/spectra_infer_parallax_zpt.parquet}"
+ALLSTAR="${ALLSTAR:-${DATA}/astraAllStarASPCAP-0.8.0.fits}"
+OUT="${OUT:-/scratch/mk27/${USER}/spphot_nn_results.parquet}"
+PIXEL_MASK_DIR="${PIXEL_MASK_DIR:-${SRC}/pixel_mask}"
+BATCH_ROWS="${BATCH_ROWS:-20000}"
+
+# NN hyper-parameters (override with -v)
+HIDDEN="${HIDDEN:-1024,512,256}"
+EPOCHS="${EPOCHS:-60}"
+BATCH_SIZE="${BATCH_SIZE:-4096}"
+LR="${LR:-1e-3}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
+DROPOUT="${DROPOUT:-0.1}"
+DEVICE="${DEVICE:-auto}"
+
+# torch CPU threads (no-op on GPU)
+export OMP_NUM_THREADS="${PBS_NCPUS:-48}"
+export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
+
+mkdir -p "$(dirname "${OUT}")"
+echo "[pbs] host=$(hostname) ncpus=${PBS_NCPUS:-?} parquet=${PARQUET}"
+echo "[pbs] out=${OUT} hidden=${HIDDEN} epochs=${EPOCHS} batch=${BATCH_SIZE} device=${DEVICE}"
+echo "[pbs] pixel_mask_dir=${PIXEL_MASK_DIR}"
+
+${PYTHON_BIN} train_nn.py \
+    --parquet "${PARQUET}" \
+    --allstar "${ALLSTAR}" \
+    --out     "${OUT}" \
+    --pixel-mask-dir "${PIXEL_MASK_DIR}" \
+    --batch-rows "${BATCH_ROWS}" \
+    --hidden "${HIDDEN}" \
+    --epochs "${EPOCHS}" \
+    --batch-size "${BATCH_SIZE}" \
+    --lr "${LR}" \
+    --weight-decay "${WEIGHT_DECAY}" \
+    --dropout "${DROPOUT}" \
+    --device "${DEVICE}"
+
+echo "[pbs] done -> ${OUT}"

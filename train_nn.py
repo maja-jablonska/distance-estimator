@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""
+train_nn.py — heteroscedastic neural-net spectrophotometric parallax.
+
+Same sample, features, zero-point, pixel masks and A/B split as run_full_gadi.py
+(it reuses run_full_gadi.prepare_sample), but instead of the linear exp(X@theta)
+fit it trains an MLP that outputs BOTH a parallax AND a per-star error. A learned,
+per-star sigma is exactly what the linear baseline lacks: with a single constant
+fractional error the eval shows mean chi2 ~ 2.6 (outlier-driven); a heteroscedastic
+model can push it toward 1 and usually tightens the scatter too.
+
+Model (features x = standardized [photometry | ln-flux on the good pixels]):
+    body  = MLP(x)              -> (z_mu, z_logs)
+    plx_sp = exp(z_mu)          positive spec parallax (log-space, like the linear model)
+    sig_sp = exp(z_logs)        positive per-star spec-parallax error
+Likelihood (parallax space, never inverted; negative Gaia parallaxes kept):
+    plx_gaia ~ Normal(plx_sp, sig_sp^2 + e_plx^2)
+    NLL = 0.5 * [ (plx - plx_sp)^2 / (sig_sp^2 + e_plx^2) + log(sig_sp^2 + e_plx^2) ]
+The Gaia measurement error e_plx is folded into the variance, so sig_sp learns the
+*intrinsic* spec-parallax scatter.
+
+Cross-validation mirrors run_full_gadi exactly: a fold-A model, a fold-B model, and
+an all-train model; each training star is predicted by the model that did NOT see its
+fold, all others by the all-train model. The results parquet uses the same schema, so
+spphot_eval scores it apples-to-apples against the linear baseline.
+
+Usage (see train_nn.pbs):
+  python train_nn.py --parquet <spectra_zpt.parquet> --allstar <allStar.fits> \
+        --pixel-mask-dir <dir> --out nn_results.parquet \
+        [--hidden 1024,512,256] [--epochs 60] [--batch-size 4096] [--device auto]
+"""
+from __future__ import annotations
+import os, sys, math, time, argparse
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+import run_full_gadi as R   # prepare_sample, log, LABEL_COLS
+from run_full_gadi import log
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# sig_sp is clamped to this range (mas) for numerical safety in exp/log
+LOG_SIG_MIN, LOG_SIG_MAX = math.log(1e-4), math.log(10.0)
+
+
+# ----------------------------------------------------------------------
+# model
+# ----------------------------------------------------------------------
+class HetMLP(nn.Module):
+    """MLP with two linear heads: log-parallax mean and log spec-error."""
+
+    def __init__(self, d_in, hidden=(1024, 512, 256), dropout=0.1):
+        super().__init__()
+        layers = []
+        d = d_in
+        for h in hidden:
+            layers += [nn.Linear(d, h), nn.SiLU(), nn.Dropout(dropout)]
+            d = h
+        self.body = nn.Sequential(*layers)
+        self.head_mu = nn.Linear(d, 1)      # z_mu   -> plx_sp = exp(z_mu)
+        self.head_logs = nn.Linear(d, 1)    # z_logs -> sig_sp = exp(z_logs)
+
+    def forward(self, x):
+        z = self.body(x)
+        return self.head_mu(z).squeeze(-1), self.head_logs(z).squeeze(-1)
+
+
+def _mu_sig(z_mu, z_logs):
+    """Map raw heads to (plx_sp, sig_sp) with the safety clamps."""
+    m = torch.exp(torch.clamp(z_mu, -30.0, 30.0))
+    sig = torch.exp(torch.clamp(z_logs, LOG_SIG_MIN, LOG_SIG_MAX))
+    return m, sig
+
+
+def het_nll(z_mu, z_logs, plx, err):
+    """Gaussian-in-parallax NLL with the Gaia error folded into the variance."""
+    m, sig = _mu_sig(z_mu, z_logs)
+    var = sig * sig + err * err
+    return 0.5 * ((plx - m) ** 2 / var + torch.log(var)).mean()
+
+
+# ----------------------------------------------------------------------
+# standardize [phot | spec] with train-fold statistics
+# ----------------------------------------------------------------------
+def standardize_fit(A):
+    mu = A.mean(0)
+    sd = A.std(0)
+    sd[sd < 1e-8] = 1.0
+    return mu.astype(np.float32), sd.astype(np.float32)
+
+
+# ----------------------------------------------------------------------
+# train / predict
+# ----------------------------------------------------------------------
+def train_fold(feats, train_mask, plx, err, mu, sd, *, hidden, dropout, lr,
+               weight_decay, epochs, batch_size, device, seed, label):
+    """Train a HetMLP on the stars in train_mask. Features are standardized per batch
+    with the supplied (mu, sd) — the train-fold stats — so nothing leaks from the
+    held-out fold."""
+    torch.manual_seed(seed)
+    idx_all = np.where(train_mask)[0]
+    n = idx_all.size
+    d_in = feats.shape[1]
+
+    model = HetMLP(d_in, hidden, dropout).to(device)
+    with torch.no_grad():                                  # sensible head biases
+        ptr = plx[idx_all]
+        med = float(np.median(ptr[ptr > 0])) if np.any(ptr > 0) else 1.0
+        model.head_mu.bias.fill_(math.log(max(med, 1e-3)))
+        model.head_logs.bias.fill_(math.log(0.1))          # ~0.1 mas initial spec error
+
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+    mu_t = torch.from_numpy(mu).to(device)
+    sd_t = torch.from_numpy(sd).to(device)
+    feats_t = torch.from_numpy(feats)                      # CPU; batches move to device
+    plx_t = torch.from_numpy(plx.astype(np.float32))
+    err_t = torch.from_numpy(err.astype(np.float32))
+    idx_t = torch.from_numpy(idx_all)
+
+    g = torch.Generator().manual_seed(seed)
+    t0 = time.time()
+    for ep in range(epochs):
+        model.train()
+        perm = idx_t[torch.randperm(n, generator=g)]
+        running = 0.0
+        for i in range(0, n, batch_size):
+            bidx = perm[i:i + batch_size]
+            xb = ((feats_t[bidx].to(device) - mu_t) / sd_t)
+            yb = plx_t[bidx].to(device)
+            eb = err_t[bidx].to(device)
+            z_mu, z_logs = model(xb)
+            loss = het_nll(z_mu, z_logs, yb, eb)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            running += float(loss) * bidx.numel()
+        sched.step()
+        if ep == 0 or (ep + 1) % 10 == 0 or ep == epochs - 1:
+            log(f"    [{label}] epoch {ep+1}/{epochs}  NLL={running/n:.4f}  "
+                f"lr={sched.get_last_lr()[0]:.2e}  ({time.time()-t0:.0f}s)")
+    return model
+
+
+def predict_nn(model, feats, idx, mu, sd, device, batch=65536):
+    """Return (plx_sp, sig_sp) for feats[idx], standardized with (mu, sd)."""
+    model.eval()
+    mu_t = torch.from_numpy(mu).to(device)
+    sd_t = torch.from_numpy(sd).to(device)
+    feats_t = torch.from_numpy(feats)
+    idx = np.asarray(idx)
+    out_m = np.empty(idx.size, np.float64)
+    out_s = np.empty(idx.size, np.float64)
+    with torch.no_grad():
+        for i in range(0, idx.size, batch):
+            bidx = torch.from_numpy(idx[i:i + batch])
+            xb = (feats_t[bidx].to(device) - mu_t) / sd_t
+            z_mu, z_logs = model(xb)
+            m, sig = _mu_sig(z_mu, z_logs)
+            out_m[i:i + batch] = m.cpu().numpy()
+            out_s[i:i + batch] = sig.cpu().numpy()
+    return out_m, out_s
+
+
+# ----------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--parquet", required=True)
+    ap.add_argument("--allstar", required=True)
+    ap.add_argument("--out", default="nn_results.parquet")
+    ap.add_argument("--model-out", default=None,
+                    help="path for the saved torch checkpoint (default: <out>_model.pt)")
+    ap.add_argument("--pixel-mask-dir", default=None)
+    ap.add_argument("--snr-min", type=float, default=100.0)
+    ap.add_argument("--bad-frac", type=float, default=0.01)
+    ap.add_argument("--batch-rows", type=int, default=20000)
+    ap.add_argument("--seed", type=int, default=42)
+    # NN hyper-parameters
+    ap.add_argument("--hidden", default="1024,512,256",
+                    help="comma-separated MLP widths")
+    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--weight-decay", type=float, default=1e-5)
+    ap.add_argument("--epochs", type=int, default=60)
+    ap.add_argument("--batch-size", type=int, default=4096)
+    ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    args = ap.parse_args()
+    import pandas as pd
+
+    device = args.device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        torch.set_num_threads(int(os.environ.get("PBS_NCPUS", os.cpu_count() or 1)))
+    hidden = tuple(int(h) for h in args.hidden.split(",") if h)
+    log(f"device={device}  hidden={hidden}  epochs={args.epochs}  batch={args.batch_size}")
+
+    # ---- identical sample/features/splits as the linear pipeline ----
+    S = R.prepare_sample(args.parquet, args.allstar, snr_min=args.snr_min,
+                         bad_frac=args.bad_frac, batch_rows=args.batch_rows,
+                         pixel_mask_dir=args.pixel_mask_dir, seed=args.seed)
+    spec = S["spec"]
+    # features = [photometry | ln-flux]; float32 for the net (frees the separate spec)
+    feats = np.hstack([S["phot"].astype(np.float32), spec]).astype(np.float32, copy=False)
+    del spec, S["spec"]
+    plx_k, err_k = S["plx"], S["err"]
+    samp_k, train_k = S["sample"], S["train"]
+    ids_k = S["ids"]
+    log(f"features: {feats.shape[0]} stars x {feats.shape[1]} (phot 8 + spec {feats.shape[1]-8})")
+
+    A = train_k & (samp_k == "A")
+    B = train_k & (samp_k == "B")
+    rest = ~train_k
+
+    hp = dict(hidden=hidden, dropout=args.dropout, lr=args.lr,
+              weight_decay=args.weight_decay, epochs=args.epochs,
+              batch_size=args.batch_size, device=device, seed=args.seed)
+
+    def fit(train_mask, label):
+        mu, sd = standardize_fit(feats[train_mask])
+        log(f"  training {label}: {int(train_mask.sum())} stars")
+        model = train_fold(feats, train_mask, plx_k, err_k, mu, sd, label=label, **hp)
+        return model, mu, sd
+
+    log("training models ...")
+    model_A, muA, sdA = fit(A, "fold-A")
+    model_B, muB, sdB = fit(B, "fold-B")
+    model_all, muAll, sdAll = fit(train_k, "all-train")
+
+    # ---- cross-validated predictions: each fold predicted by the OTHER fold ----
+    log("predicting spec parallaxes ...")
+    plx_sp = np.empty(len(plx_k))
+    err_sp = np.empty(len(plx_k))
+    for mask, model, mu, sd, tag in (
+        (A, model_B, muB, sdB, "A<-B"),
+        (B, model_A, muA, sdA, "B<-A"),
+        (rest, model_all, muAll, sdAll, "rest<-all"),
+    ):
+        idx = np.where(mask)[0]
+        if idx.size:
+            plx_sp[idx], err_sp[idx] = predict_nn(model, feats, idx, mu, sd, device)
+
+    dist_kpc = 1.0 / plx_sp
+
+    # ---- write results (same schema as run_full_gadi) ----
+    pd.DataFrame({
+        "sdss_id": ids_k,
+        "plx": plx_k, "e_plx": err_k,
+        "plx_raw": S["plx_raw"], "zeropoint": S["zeropoint"],
+        "plx_sp": plx_sp, "err_sp": err_sp,
+        "dist_sp_kpc": dist_kpc,
+        "r_med_photogeo_pc": S["dist_bj"],
+        "sample": samp_k, "train": train_k,
+        "spec_bad_frac": S["star_bad"],
+    }).to_parquet(args.out, index=False)
+
+    model_out = args.model_out or (os.path.splitext(args.out)[0] + "_model.pt")
+    torch.save({
+        "state_dict": model_all.state_dict(),
+        "mu": muAll, "sd": sdAll,
+        "good_pixel_mask": S["good"],
+        "hidden": list(hidden), "dropout": args.dropout,
+        "label_cols": list(R.LABEL_COLS), "d_in": int(feats.shape[1]),
+        "snr_min": args.snr_min, "bad_frac": args.bad_frac, "seed": args.seed,
+    }, model_out)
+    log(f"wrote {args.out}  ({len(plx_k)} stars)")
+    log(f"saved model -> {model_out}")
+
+    # ---- cross-validated eval report (same metrics as the linear baseline) ----
+    import spphot_eval as E
+    cat = {"plx_a": plx_k[train_k], "err_a": err_k[train_k],
+           "plx_sp": plx_sp[train_k], "err_sp": err_sp[train_k],
+           "train": np.ones(int(train_k.sum()), bool), "sample": samp_k[train_k],
+           "id": ids_k[train_k]}
+    print()
+    E.print_report(E.evaluate(cat, label="heteroscedastic NN"))
+    print()
+    for f in ("A", "B"):
+        E.print_report(E.evaluate(cat, fold=f, label="heteroscedastic NN"))
+        print()
+
+
+if __name__ == "__main__":
+    main()
