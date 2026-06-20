@@ -50,6 +50,9 @@ DEVICE="${DEVICE:-auto}"
 #   qsub -v LOSS=studentt,OUT=/scratch/mk27/$USER/spphot_nn_studentt.parquet train_nn.pbs
 LOSS="${LOSS:-gauss}"
 NU="${NU:-4}"
+# beta-NLL weight for the Gaussian loss (Seitzer+22): 0.5 reduces the mean-fit bias
+# of plain NLL; set 0 to reproduce the pure-NLL run.
+BETA="${BETA:-0.5}"
 
 # torch CPU threads (no-op on GPU)
 export OMP_NUM_THREADS="${PBS_NCPUS:-48}"
@@ -57,7 +60,7 @@ export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
 
 mkdir -p "$(dirname "${OUT}")"
 echo "[pbs] host=$(hostname) ncpus=${PBS_NCPUS:-?} parquet=${PARQUET}"
-echo "[pbs] out=${OUT} hidden=${HIDDEN} epochs=${EPOCHS} batch=${BATCH_SIZE} device=${DEVICE} loss=${LOSS} nu=${NU}"
+echo "[pbs] out=${OUT} hidden=${HIDDEN} epochs=${EPOCHS} batch=${BATCH_SIZE} device=${DEVICE} loss=${LOSS} nu=${NU} beta=${BETA}"
 echo "[pbs] pixel_mask_dir=${PIXEL_MASK_DIR}"
 
 ${PYTHON_BIN} train_nn.py \
@@ -74,6 +77,7 @@ ${PYTHON_BIN} train_nn.py \
     --dropout "${DROPOUT}" \
     --device "${DEVICE}" \
     --loss "${LOSS}" \
-    --nu "${NU}"
+    --nu "${NU}" \
+    --beta "${BETA}"
 
 echo "[pbs] done -> ${OUT}"

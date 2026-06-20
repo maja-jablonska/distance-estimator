@@ -76,11 +76,20 @@ def _mu_sig(z_mu, z_logs):
     return m, sig
 
 
-def het_nll(z_mu, z_logs, plx, err):
-    """Gaussian-in-parallax NLL with the Gaia error folded into the variance."""
+def het_nll(z_mu, z_logs, plx, err, beta=0.0):
+    """Gaussian-in-parallax NLL with the Gaia error folded into the variance.
+
+    beta>0 gives the beta-NLL of Seitzer et al. 2022: each star's loss is weighted by
+    detach(var)**beta. Plain NLL (beta=0) down-weights high-variance stars and so
+    UNDERFITS the mean there (-> biased, unstable variance head); beta=0.5 restores
+    the mean's gradient in those regions (beta=1 ~ MSE) and removes most of that bias
+    while keeping the calibration."""
     m, sig = _mu_sig(z_mu, z_logs)
     var = sig * sig + err * err
-    return 0.5 * ((plx - m) ** 2 / var + torch.log(var)).mean()
+    nll = 0.5 * ((plx - m) ** 2 / var + torch.log(var))
+    if beta > 0:
+        nll = nll * var.detach() ** beta
+    return nll.mean()
 
 
 def studentt_nll(z_mu, z_logs, plx, err, nu):
@@ -153,7 +162,7 @@ def train_fold(feats, train_mask, plx, err, mu, sd, *, loss_fn, hidden, dropout,
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-            running += float(loss) * bidx.numel()
+            running += loss.item() * bidx.numel()
         sched.step()
         if ep == 0 or (ep + 1) % 10 == 0 or ep == epochs - 1:
             log(f"    [{label}] epoch {ep+1}/{epochs}  NLL={running/n:.4f}  "
@@ -211,6 +220,9 @@ def main():
     ap.add_argument("--nu", type=float, default=4.0,
                     help="Student-t degrees of freedom (only used with --loss studentt; "
                          "smaller = heavier tails / more robust)")
+    ap.add_argument("--beta", type=float, default=0.5,
+                    help="beta-NLL weight for --loss gauss (Seitzer+22): 0 = plain NLL "
+                         "(underfits the mean -> biased), 0.5 = recommended, 1 = MSE-like")
     args = ap.parse_args()
     import pandas as pd
 
@@ -221,9 +233,10 @@ def main():
         std_factor = math.sqrt(nu / (nu - 2.0)) if nu > 2.0 else 1.0
         log(f"loss=studentt (nu={nu:g}); err_sp = scale * {std_factor:.3f}")
     else:
-        loss_fn = het_nll
+        beta = args.beta
+        loss_fn = lambda zmu, zls, y, e: het_nll(zmu, zls, y, e, beta=beta)
         std_factor = 1.0
-        log("loss=gauss (heteroscedastic Gaussian)")
+        log(f"loss=gauss (heteroscedastic Gaussian, beta-NLL beta={beta:g})")
 
     device = args.device
     if device == "auto":
@@ -302,7 +315,7 @@ def main():
         "hidden": list(hidden), "dropout": args.dropout,
         "label_cols": list(R.LABEL_COLS), "d_in": int(feats.shape[1]),
         "snr_min": args.snr_min, "bad_frac": args.bad_frac, "seed": args.seed,
-        "loss": args.loss, "nu": args.nu, "std_factor": std_factor,
+        "loss": args.loss, "nu": args.nu, "beta": args.beta, "std_factor": std_factor,
     }, model_out)
     log(f"wrote {args.out}  ({len(plx_k)} stars)")
     log(f"saved model -> {model_out}")
