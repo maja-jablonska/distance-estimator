@@ -251,7 +251,7 @@ def design(phot, spec, stats=None):
     return np.hstack([np.ones((len(A), 1)), A]), stats
 
 
-def _gn_fit(X, plx, sigma, lam, maxiter=100, gtol=1e-7, ftol=1e-12):
+def _gn_fit(X, plx, sigma, lam, maxiter=100, gtol=1e-7, ftol=1e-12, theta0=None):
     """theta for plx ~ exp(X @ theta): Gaussian-in-parallax NLL + L2 ridge.
 
     Log-space ridge warm-start (positive parallaxes), then a damped Gauss-Newton
@@ -276,13 +276,17 @@ def _gn_fit(X, plx, sigma, lam, maxiter=100, gtol=1e-7, ftol=1e-12):
     invN = 1.0 / N
     inv_s2 = 1.0 / sigma ** 2
 
-    # --- warm start: log-space ridge on positive parallaxes ---
-    pos = plx > 0
-    Xw, yw = X[pos], np.log(plx[pos])
-    try:
-        theta = np.linalg.solve(Xw.T @ Xw + np.diag(reg) * pos.sum(), Xw.T @ yw)
-    except np.linalg.LinAlgError:
-        theta = np.zeros(D); theta[0] = np.log(np.median(plx[pos]))
+    # --- warm start: a supplied theta0 (e.g. the previous sigma-clip round, already
+    # near-optimal) else the log-space ridge solution on positive parallaxes ---
+    if theta0 is not None:
+        theta = np.array(theta0, float)
+    else:
+        pos = plx > 0
+        Xw, yw = X[pos], np.log(plx[pos])
+        try:
+            theta = np.linalg.solve(Xw.T @ Xw + np.diag(reg) * pos.sum(), Xw.T @ yw)
+        except np.linalg.LinAlgError:
+            theta = np.zeros(D); theta[0] = np.log(np.median(plx[pos]))
 
     def objective(th):
         m = np.exp(np.clip(X @ th, -30.0, 30.0))
@@ -373,7 +377,10 @@ def fit_parallax_model(X, plx, sigma, lam, maxiter=100, gtol=1e-7, ftol=1e-12,
             if int(new_keep.sum()) == int(keep.sum()):
                 break                                  # converged: nothing new clipped
             keep = new_keep
-            theta, res = _gn_fit(X[keep], plx[keep], sigma[keep], lam, maxiter, gtol, ftol)
+            # warm-start from the current theta: dropping ~1% of stars barely moves
+            # the optimum, so GN re-converges in a couple of iterations
+            theta, res = _gn_fit(X[keep], plx[keep], sigma[keep], lam,
+                                 maxiter, gtol, ftol, theta0=theta)
     res.n_clipped = int(N - keep.sum())
     res.n_used = int(keep.sum())
     return theta, res
@@ -477,10 +484,11 @@ def main():
                          "runs the full pipeline with it")
     ap.add_argument("--snr-min", type=float, default=100.0, help="training S/N cut")
     ap.add_argument("--bad-frac", type=float, default=0.01, help="shared good-pixel threshold")
-    ap.add_argument("--clip-sigma", type=float, default=0.0,
+    ap.add_argument("--clip-sigma", type=float, default=4.0,
                     help="iterative training-set sigma-clip on the parallax residual "
-                         "(0 = off; ~4 to enable). CAUTION: can bias the estimator — "
-                         "watch the reported bias")
+                         "(default 4; 0 = off). Removes high-chi outliers (binaries, "
+                         "bad astrometry); empirically improves scatter AND bias here, "
+                         "but it is a parallax cut — watch the reported bias")
     ap.add_argument("--batch-rows", type=int, default=20000)
     ap.add_argument("--pixel-mask-dir", default=None,
                     help="dir with per-telescope pixel_lit_mask_<tel>.npy; keeps only "

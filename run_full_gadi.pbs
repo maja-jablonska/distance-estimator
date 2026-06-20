@@ -46,10 +46,10 @@ LAM="${LAM:-0.1}"
 # or pass it semicolon-separated through -v (the script accepts , ; or space):
 #   qsub -v LAM_SCAN="0.003;0.01;0.03;0.1;0.3" run_full_gadi.pbs
 LAM_SCAN="${LAM_SCAN:-}"
-# optional training-set sigma-clip on the parallax residual (0 = off; ~4 to try).
-# CAUTION: can bias the estimator — compare the bias line against a clip-off run.
-#   qsub -v CLIP_SIGMA=4 run_full_gadi.pbs
-CLIP_SIGMA="${CLIP_SIGMA:-0}"
+# training-set sigma-clip on the parallax residual (default 4; 0 = off). Improves
+# scatter and bias here, but it is a parallax cut — set 0 to compare a clip-off run:
+#   qsub -v CLIP_SIGMA=0 run_full_gadi.pbs
+CLIP_SIGMA="${CLIP_SIGMA:-4}"
 BATCH_ROWS="${BATCH_ROWS:-20000}"
 # per-telescope pixel_lit_mask_<tel>.npy live here (keep only lit pixels)
 PIXEL_MASK_DIR="${PIXEL_MASK_DIR:-${SRC}/pixel_mask}"
