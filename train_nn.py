@@ -24,10 +24,18 @@ an all-train model; each training star is predicted by the model that did NOT se
 fold, all others by the all-train model. The results parquet uses the same schema, so
 spphot_eval scores it apples-to-apples against the linear baseline.
 
+The eval report now also prints an OVERFIT GAP (robust scatter from in-fold vs
+held-out predictions): the MLP can overfit where the linear model can't, so a
+large gap says trust only the held-out number and regularize harder.
+
 Usage (see train_nn.pbs):
   python train_nn.py --parquet <spectra_zpt.parquet> --allstar <allStar.fits> \
         --pixel-mask-dir <dir> --out nn_results.parquet \
         [--hidden 1024,512,256] [--epochs 60] [--batch-size 4096] [--device auto]
+
+  # beta-NLL calibration<->bias sweep (one sample prep, one model per beta):
+  python train_nn.py ... --out nn.parquet --beta-sweep 0.2,0.3,0.5,0.7
+  #   -> nn_gauss-beta0.2.parquet, ... ; compare bias vs robust chi2 across them
 """
 from __future__ import annotations
 import os, sys, math, time, argparse
@@ -223,20 +231,13 @@ def main():
     ap.add_argument("--beta", type=float, default=0.5,
                     help="beta-NLL weight for --loss gauss (Seitzer+22): 0 = plain NLL "
                          "(underfits the mean -> biased), 0.5 = recommended, 1 = MSE-like")
+    ap.add_argument("--beta-sweep", default=None,
+                    help="comma-separated betas, e.g. '0.2,0.3,0.5,0.7'. Trains one "
+                         "gauss model per beta, REUSING the sample prep once; writes "
+                         "<out>_gauss-beta<b>.parquet for each. Overrides --loss/--beta.")
     args = ap.parse_args()
     import pandas as pd
-
-    # likelihood + the factor turning the t SCALE into a 1-sigma std for the eval/output
-    if args.loss == "studentt":
-        nu = args.nu
-        loss_fn = lambda zmu, zls, y, e: studentt_nll(zmu, zls, y, e, nu)
-        std_factor = math.sqrt(nu / (nu - 2.0)) if nu > 2.0 else 1.0
-        log(f"loss=studentt (nu={nu:g}); err_sp = scale * {std_factor:.3f}")
-    else:
-        beta = args.beta
-        loss_fn = lambda zmu, zls, y, e: het_nll(zmu, zls, y, e, beta=beta)
-        std_factor = 1.0
-        log(f"loss=gauss (heteroscedastic Gaussian, beta-NLL beta={beta:g})")
+    import spphot_eval as E
 
     device = args.device
     if device == "auto":
@@ -246,7 +247,8 @@ def main():
     hidden = tuple(int(h) for h in args.hidden.split(",") if h)
     log(f"device={device}  hidden={hidden}  epochs={args.epochs}  batch={args.batch_size}")
 
-    # ---- identical sample/features/splits as the linear pipeline ----
+    # ---- identical sample/features/splits as the linear pipeline. Built ONCE and
+    #      reused across every sweep config (this is the expensive step). ----
     S = R.prepare_sample(args.parquet, args.allstar, snr_min=args.snr_min,
                          bad_frac=args.bad_frac, batch_rows=args.batch_rows,
                          pixel_mask_dir=args.pixel_mask_dir, seed=args.seed)
@@ -263,78 +265,110 @@ def main():
     B = train_k & (samp_k == "B")
     rest = ~train_k
 
-    hp = dict(loss_fn=loss_fn, hidden=hidden, dropout=args.dropout, lr=args.lr,
+    hp = dict(hidden=hidden, dropout=args.dropout, lr=args.lr,
               weight_decay=args.weight_decay, epochs=args.epochs,
               batch_size=args.batch_size, device=device, seed=args.seed)
 
-    def fit(train_mask, label):
-        mu, sd = standardize_fit(feats[train_mask])
-        log(f"  training {label}: {int(train_mask.sum())} stars")
-        model = train_fold(feats, train_mask, plx_k, err_k, mu, sd, label=label, **hp)
-        return model, mu, sd
+    def make_loss(kind, beta, nu):
+        """-> (loss_fn, std_factor, tag). std_factor turns the t SCALE into a
+        1-sigma std for the output/eval (1.0 for the Gaussian)."""
+        if kind == "studentt":
+            sf = math.sqrt(nu / (nu - 2.0)) if nu > 2.0 else 1.0
+            return (lambda zmu, zls, y, e: studentt_nll(zmu, zls, y, e, nu), sf,
+                    f"studentt-nu{nu:g}")
+        return (lambda zmu, zls, y, e: het_nll(zmu, zls, y, e, beta=beta), 1.0,
+                f"gauss-beta{beta:g}")
 
-    log("training models ...")
-    model_A, muA, sdA = fit(A, "fold-A")
-    model_B, muB, sdB = fit(B, "fold-B")
-    model_all, muAll, sdAll = fit(train_k, "all-train")
+    def run_config(loss_fn, std_factor, tag, out_path, model_out, meta):
+        def fit(train_mask, label):
+            mu, sd = standardize_fit(feats[train_mask])
+            log(f"  training {label}: {int(train_mask.sum())} stars")
+            model = train_fold(feats, train_mask, plx_k, err_k, mu, sd,
+                               loss_fn=loss_fn, label=label, **hp)
+            return model, mu, sd
 
-    # ---- cross-validated predictions: each fold predicted by the OTHER fold ----
-    log("predicting spec parallaxes ...")
-    plx_sp = np.empty(len(plx_k))
-    err_sp = np.empty(len(plx_k))
-    for mask, model, mu, sd, tag in (
-        (A, model_B, muB, sdB, "A<-B"),
-        (B, model_A, muA, sdA, "B<-A"),
-        (rest, model_all, muAll, sdAll, "rest<-all"),
-    ):
-        idx = np.where(mask)[0]
-        if idx.size:
-            m_i, s_i = predict_nn(model, feats, idx, mu, sd, device)
-            plx_sp[idx] = m_i
-            err_sp[idx] = s_i * std_factor      # t scale -> 1-sigma std (1.0 for gauss)
+        log(f"=== config {tag}: training models ===")
+        model_A, muA, sdA = fit(A, "fold-A")
+        model_B, muB, sdB = fit(B, "fold-B")
+        model_all, muAll, sdAll = fit(train_k, "all-train")
 
-    dist_kpc = 1.0 / plx_sp
+        def predict_into(pairs):
+            p = np.empty(len(plx_k)); s = np.empty(len(plx_k))
+            for mask, model, mu, sd in pairs:
+                idx = np.where(mask)[0]
+                if idx.size:
+                    m_i, s_i = predict_nn(model, feats, idx, mu, sd, device)
+                    p[idx] = m_i
+                    s[idx] = s_i * std_factor   # t scale -> 1-sigma std (1.0 for gauss)
+            return p, s
 
-    # ---- write results (same schema as run_full_gadi) ----
-    pd.DataFrame({
-        "sdss_id": ids_k,
-        "plx": plx_k, "e_plx": err_k,
-        "plx_raw": S["plx_raw"], "zeropoint": S["zeropoint"],
-        "plx_sp": plx_sp, "err_sp": err_sp,
-        "dist_sp_kpc": dist_kpc,
-        "r_med_photogeo_pc": S["dist_bj"],
-        "sample": samp_k, "train": train_k,
-        "spec_bad_frac": S["star_bad"],
-    }).to_parquet(args.out, index=False)
+        # held-out (honest): each fold predicted by the OTHER fold; rest by all-train
+        plx_sp, err_sp = predict_into([(A, model_B, muB, sdB),
+                                       (B, model_A, muA, sdA),
+                                       (rest, model_all, muAll, sdAll)])
+        # in-fold (optimistic): each train fold by ITS OWN model -> overfit gauge
+        plx_in, err_in = predict_into([(A, model_A, muA, sdA),
+                                       (B, model_B, muB, sdB)])
 
-    model_out = args.model_out or (os.path.splitext(args.out)[0] + "_model.pt")
-    torch.save({
-        "state_dict": model_all.state_dict(),
-        "mu": muAll, "sd": sdAll,
-        "good_pixel_mask": S["good"],
-        "hidden": list(hidden), "dropout": args.dropout,
-        "label_cols": list(R.LABEL_COLS), "d_in": int(feats.shape[1]),
-        "snr_min": args.snr_min, "bad_frac": args.bad_frac, "seed": args.seed,
-        "loss": args.loss, "nu": args.nu, "beta": args.beta, "std_factor": std_factor,
-    }, model_out)
-    log(f"wrote {args.out}  ({len(plx_k)} stars)")
-    log(f"saved model -> {model_out}")
+        dist_kpc = 1.0 / plx_sp
+        pd.DataFrame({
+            "sdss_id": ids_k,
+            "plx": plx_k, "e_plx": err_k,
+            "plx_raw": S["plx_raw"], "zeropoint": S["zeropoint"],
+            "plx_sp": plx_sp, "err_sp": err_sp,
+            "dist_sp_kpc": dist_kpc,
+            "r_med_photogeo_pc": S["dist_bj"],
+            "sample": samp_k, "train": train_k,
+            "spec_bad_frac": S["star_bad"],
+        }).to_parquet(out_path, index=False)
 
-    # ---- cross-validated eval report (same metrics as the linear baseline) ----
-    import spphot_eval as E
-    label = f"het-NN ({args.loss})"
-    cat = {"plx_a": plx_k[train_k], "err_a": err_k[train_k],
-           "plx_sp": plx_sp[train_k], "err_sp": err_sp[train_k],
-           "train": np.ones(int(train_k.sum()), bool), "sample": samp_k[train_k],
-           "id": ids_k[train_k]}
-    print()
-    E.print_report(E.evaluate(cat, label=label))
-    E.print_calibration(*E.calibrate(cat))
-    print()
-    for f in ("A", "B"):
-        E.print_report(E.evaluate(cat, fold=f, label=label))
-        E.print_calibration(*E.calibrate(cat, fold=f))
+        torch.save({
+            "state_dict": model_all.state_dict(),
+            "mu": muAll, "sd": sdAll,
+            "good_pixel_mask": S["good"],
+            "hidden": list(hidden), "dropout": args.dropout,
+            "label_cols": list(R.LABEL_COLS), "d_in": int(feats.shape[1]),
+            "snr_min": args.snr_min, "bad_frac": args.bad_frac, "seed": args.seed,
+            "std_factor": std_factor, **meta,
+        }, model_out)
+        log(f"wrote {out_path}  ({len(plx_k)} stars); saved model -> {model_out}")
+
+        # ---- eval (same metrics as the linear baseline) + calibration + overfit gap ----
+        def make_cat(p, e):
+            return {"plx_a": plx_k[train_k], "err_a": err_k[train_k],
+                    "plx_sp": p[train_k], "err_sp": e[train_k],
+                    "train": np.ones(int(train_k.sum()), bool),
+                    "sample": samp_k[train_k], "id": ids_k[train_k]}
+        cat, cat_in = make_cat(plx_sp, err_sp), make_cat(plx_in, err_in)
+        label = f"het-NN ({tag})"
         print()
+        E.print_report(E.evaluate(cat, label=label))
+        E.print_overfit_gap(E.evaluate(cat_in, label="in-fold"),
+                            E.evaluate(cat, label="held-out"))
+        E.print_calibration(*E.calibrate(cat))
+        print()
+        for f in ("A", "B"):
+            E.print_report(E.evaluate(cat, fold=f, label=label))
+            E.print_calibration(*E.calibrate(cat, fold=f))
+            print()
+
+    # ---- build the run list: a single config, or a gauss beta sweep ----
+    if args.beta_sweep:
+        betas = [float(b) for b in args.beta_sweep.split(",") if b.strip()]
+        configs = [("gauss", b, args.nu) for b in betas]
+        log(f"beta sweep over {betas} (gauss); sample prep reused across all configs")
+    else:
+        configs = [(args.loss, args.beta, args.nu)]
+
+    base, ext = os.path.splitext(args.out)
+    for kind, beta, nu in configs:
+        loss_fn, std_factor, tag = make_loss(kind, beta, nu)
+        single = len(configs) == 1
+        out_path = args.out if single else f"{base}_{tag}{ext}"
+        model_out = (args.model_out if (single and args.model_out)
+                     else os.path.splitext(out_path)[0] + "_model.pt")
+        run_config(loss_fn, std_factor, tag, out_path, model_out,
+                   {"loss": kind, "beta": beta, "nu": nu})
 
 
 if __name__ == "__main__":

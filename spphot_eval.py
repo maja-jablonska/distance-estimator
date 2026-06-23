@@ -255,6 +255,29 @@ def print_report(rep):
     print(f"    (mean chi2 >> 1 means outlier-driven; honest errors -> ~1)")
 
 
+def overfit_gap(infold, heldout):
+    """Compare robust fractional scatter from IN-FOLD vs HELD-OUT predictions.
+
+    infold/heldout are evaluate() reports built from, respectively, predictions
+    where each star was scored by a model that DID train on it, and by one that
+    did NOT. The linear L1 model barely overfits; an MLP can. A large gap means
+    the held-out (honest) number is the only one to trust and you should raise
+    dropout / weight_decay or shrink the net.
+    """
+    a, b = infold["robust_frac_scatter"], heldout["robust_frac_scatter"]
+    return {"in_fold": a, "held_out": b, "gap_pp": 100 * (b - a)}
+
+
+def print_overfit_gap(infold, heldout):
+    g = overfit_gap(infold, heldout)
+    verdict = ("ok (not overfitting)" if g["gap_pp"] < 1.0
+               else "OVERFIT -> raise dropout/weight_decay or shrink net")
+    print("  overfit gap (robust frac scatter, high-S/N probe):")
+    print(f"    in-fold (optimistic) : {100*g['in_fold']:.2f} %")
+    print(f"    held-out (honest)    : {100*g['held_out']:.2f} %")
+    print(f"    gap                  : {g['gap_pp']:+.2f} pp  ({verdict})")
+
+
 if __name__ == "__main__":
     import sys
     path = sys.argv[1] if len(sys.argv) > 1 else "hogg2018.fits"
