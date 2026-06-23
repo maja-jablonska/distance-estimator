@@ -329,9 +329,11 @@ def main():
            "id": ids_k[train_k]}
     print()
     E.print_report(E.evaluate(cat, label=label))
+    E.print_calibration(*E.calibrate(cat))
     print()
     for f in ("A", "B"):
         E.print_report(E.evaluate(cat, fold=f, label=label))
+        E.print_calibration(*E.calibrate(cat, fold=f))
         print()
 
 
