@@ -195,6 +195,21 @@ def add_crosswalk(df, xref, *, left_id="sdss_id", xref_left="sdss_id",
     return df.merge(xref, on=left_id, how="left")
 
 
+def members_from_labels(df, col="cluster"):
+    """{cluster: row-position array} from a per-star cluster-label column already
+    IN df. Use this when the catalog was crossmatched to clusters upstream (e.g.
+    apply_nn.py --cluster-name / --cluster-col), so no id matching is needed.
+    """
+    import pandas as pd
+    labels = df[col].to_numpy()
+    out = {}
+    for cl in pd.unique(labels):
+        if cl is None or (isinstance(cl, float) and np.isnan(cl)):
+            continue
+        out[str(cl)] = np.where(labels == cl)[0]
+    return out
+
+
 def match_membership(df, members, *, cat_id="sdss_id", mem_cluster="cluster",
                      mem_id=None, normalize_ids=False):
     """Map each cluster to the integer row positions of its members in df.

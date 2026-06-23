@@ -1,0 +1,76 @@
+#!/bin/bash
+#PBS -N spphot_nn_clusters
+#PBS -P mk27
+#PBS -q rsaa
+#PBS -l ncpus=16
+#PBS -l mem=64GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
+#PBS -l wd
+#PBS -j oe
+#PBS -m abe
+#PBS -M maja.jablonska@anu.edu.au
+
+# --------------------------------------------------------------------------
+# Cluster validation (Hogg+18 Fig 4) for the heteroscedastic NN.
+#
+# For each per-cluster spectra parquet (filename = cluster name), apply the SAVED
+# NN checkpoint to infer spec parallaxes/distances (apply_nn.py, reusing the exact
+# training features/pixel-mask), then run the cluster test on the concatenation
+# (run_cluster_test.py): IVW spec vs Gaia mean, member tightness, and the
+# Gaia-free internal chi2 calibration check.
+#
+# The shared allStar provides Gaia plx + photometry for every cluster's members.
+#
+# Submit:
+#   qsub -v CLUSTER_DIR=/scratch/mk27/$USER/clusters,MODEL=/scratch/mk27/$USER/spphot_nn_results_model.pt apply_nn.pbs
+#   qsub -v ERR_SCALE=1.49 apply_nn.pbs        # preview your recalibration factor
+# --------------------------------------------------------------------------
+
+set -euo pipefail
+export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}"
+
+SRC="${SRC:-/scratch/mk27/mj8805}"
+DATA="${DATA:-${SRC}/bulge-ages-and-orbits/data}"
+ALLSTAR="${ALLSTAR:-${DATA}/astraAllStarASPCAP-0.8.0.fits}"
+PIXEL_MASK_DIR="${PIXEL_MASK_DIR:-${SRC}/pixel_mask}"
+MODEL="${MODEL:-/scratch/mk27/${USER}/spphot_nn_results_model.pt}"
+
+# directory of per-cluster spectra parquets, and where applied catalogs go
+CLUSTER_DIR="${CLUSTER_DIR:-${DATA}/clusters}"
+OUT_DIR="${OUT_DIR:-/scratch/mk27/${USER}/cluster_nn}"
+OFFSET="${OFFSET:-0.0}"          # set to your zero-point if cluster parquets lack 'zeropoint'
+ERR_SCALE="${ERR_SCALE:-1.0}"    # set to your recal factor to preview a calibrated internal chi2
+PLX_G="${PLX_G:-plx}"            # 'plx' (zero-point corrected) or 'plx_raw'
+
+export OMP_NUM_THREADS="${PBS_NCPUS:-16}"
+export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
+mkdir -p "${OUT_DIR}"
+
+echo "[pbs] host=$(hostname) model=${MODEL}"
+echo "[pbs] clusters=${CLUSTER_DIR} -> applied=${OUT_DIR}  offset=${OFFSET} err_scale=${ERR_SCALE}"
+
+shopt -s nullglob
+files=("${CLUSTER_DIR}"/*.parquet)
+if [ ${#files[@]} -eq 0 ]; then
+    echo "[pbs] no .parquet files in ${CLUSTER_DIR}"; exit 1
+fi
+echo "[pbs] ${#files[@]} cluster file(s) to process"
+
+for f in "${files[@]}"; do
+    name="$(basename "${f}" .parquet)"
+    echo "[pbs] --- ${name} ---"
+    ${PYTHON_BIN} apply_nn.py \
+        --model "${MODEL}" \
+        --parquet "${f}" \
+        --allstar "${ALLSTAR}" \
+        --pixel-mask-dir "${PIXEL_MASK_DIR}" \
+        --cluster-name "${name}" \
+        --out "${OUT_DIR}/${name}_nn.parquet"
+done
+
+echo "[pbs] === cluster test ==="
+${PYTHON_BIN} run_cluster_test.py "${OUT_DIR}"/*_nn.parquet \
+    --offset "${OFFSET}" --err-scale "${ERR_SCALE}" --plx-g "${PLX_G}"
+
+echo "[pbs] done -> ${OUT_DIR}"
