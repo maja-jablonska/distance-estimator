@@ -23,15 +23,23 @@ Membership is the only fiddly part because your catalog is keyed by sdss_id whil
 the member catalogs are keyed by 2MASS / Gaia source_id. See match_membership()
 and add_crosswalk() for the two-step (load members -> crosswalk ids -> match).
 
-Typical use (NN parquet + OCCAM open clusters):
+In SDSS-V astra allStar the 2MASS id (sdss4_apogee_id) is populated for only
+~8% of stars, but gaia_dr3_source_id is there for ~99.6%. So crosswalk on the
+GAIA source id and use Gaia-keyed member catalogs: Cantat-Gaudin et al. 2020
+(open clusters, Gaia DR2 ids) and Vasiliev & Baumgardt 2021 (globulars, Gaia
+EDR3 ids). Match each catalog to the corresponding allStar column
+(gaia_dr2_source_id vs gaia_dr3_source_id).
+
+Typical use (NN parquet + Cantat-Gaudin open clusters):
 
     import pandas as pd, cluster_test as C
     df = pd.read_parquet("nn_out.parquet")
-    occam = C.load_occam("occam_member-DR17.fits", prob_min=0.8)   # cluster, tmass_id
-    df = C.add_crosswalk(df, "allStar.fits",                       # sdss_id -> tmass_id
-                         left_id="sdss_id", xref_left="sdss_id", xref_right="GAIAEDR3_2MASS_ID")
-    members = C.match_membership(df, occam, cat_id="tmass_id", mem_cluster="cluster",
-                                 mem_id="tmass_id")
+    cg = C.load_cantat_gaudin("cantat-gaudin-2020-members.fits", prob_min=0.7)
+    df = C.add_crosswalk(df, "astraAllStarASPCAP-0.8.0.fits",     # add df['gaia_id']
+                         xref_left="sdss_id", xref_right="gaia_dr2_source_id",
+                         new_col="gaia_id")                       # DR2 to match CG2020
+    members = C.match_membership(df, cg, cat_id="gaia_id",
+                                 mem_cluster="cluster", mem_id="gaia_id")
     report = C.run_cluster_test(df, members, offset=0.0)
     C.print_cluster_test(report)
 """
@@ -145,33 +153,46 @@ def cluster_metrics(plx_sp, err_sp, plx_a, err_a, *, offset=0.0,
 # membership matching  (cat keyed by sdss_id; members keyed by 2MASS/Gaia id)
 # ----------------------------------------------------------------------
 def add_crosswalk(df, xref, *, left_id="sdss_id", xref_left="sdss_id",
-                  xref_right="tmass_id", new_col="tmass_id"):
+                  xref_right="gaia_dr3_source_id", new_col="gaia_id", hdu=None):
     """Attach an external id to df via a crosswalk table (e.g. allStar).
 
     df    : your catalog (a pandas DataFrame with `left_id`)
     xref  : a crosswalk -- a pandas DataFrame, or a path to a FITS/parquet with
             both `xref_left` (matches df.left_id) and `xref_right` (the id you
-            want, e.g. the 2MASS / Gaia source id used by the member catalog)
-    Adds df[new_col]. Left-join, so unmatched rows get NaN.
+            want, e.g. gaia_dr2_source_id / gaia_dr3_source_id).
+    hdu   : FITS extension to read; None -> first HDU with rows (astra allStar
+            keeps its table in HDU 2, not 1).
+    Adds df[new_col]. Left-join, so unmatched rows get NaN. Only the two needed
+    columns are read from FITS, so a multi-GB allStar costs ~tens of MB.
     """
-    import pandas as pd
+    import pandas as pd, numpy as np
     if isinstance(xref, str):
         if xref.endswith((".fits", ".fit", ".fits.gz")):
-            from astropy.table import Table
-            xref = Table.read(xref)[[xref_left, xref_right]].to_pandas()
+            from astropy.io import fits
+            with fits.open(xref, memmap=True) as f:
+                if hdu is None:
+                    hdu = next(i for i, h in enumerate(f)
+                               if h.header.get("NAXIS2", 0) > 0)
+                d = f[hdu].data
+                # FITS is big-endian; pandas/numpy hashing wants native order
+                native = lambda a: a.astype(a.dtype.newbyteorder("="))
+                xref = pd.DataFrame(
+                    {left_id: native(np.asarray(d[xref_left])),
+                     new_col: native(np.asarray(d[xref_right]))})
         else:
-            xref = pd.read_parquet(xref, columns=[xref_left, xref_right])
-    xref = xref[[xref_left, xref_right]].rename(
-        columns={xref_left: left_id, xref_right: new_col}).drop_duplicates(left_id)
+            xref = pd.read_parquet(xref, columns=[xref_left, xref_right]).rename(
+                columns={xref_left: left_id, xref_right: new_col})
+    else:
+        xref = xref[[xref_left, xref_right]].rename(
+            columns={xref_left: left_id, xref_right: new_col})
+    # drop unmatched/zero ids so they can't collide on a 0 sentinel
+    if np.issubdtype(np.asarray(xref[new_col]).dtype, np.integer):
+        xref = xref[xref[new_col] != 0]
+        # nullable Int64 so the left-join's unmatched rows become <NA> WITHOUT
+        # upcasting to float64 -- 19-digit Gaia source ids exceed float precision
+        xref[new_col] = xref[new_col].astype("Int64")
+    xref = xref.drop_duplicates(left_id)
     return df.merge(xref, on=left_id, how="left")
-
-
-def _norm_id(s):
-    """Normalize ids for matching: strip, drop a leading '2M', upper-case."""
-    s = np.asarray(s).astype(str)
-    s = np.char.strip(s)
-    s = np.char.upper(s)
-    return np.char.replace(s, "2M", "")
 
 
 def match_membership(df, members, *, cat_id="sdss_id", mem_cluster="cluster",
@@ -184,19 +205,32 @@ def match_membership(df, members, *, cat_id="sdss_id", mem_cluster="cluster",
                  (`mem_id`).
     cat_id     : the df column to match on (e.g. 'sdss_id', or 'tmass_id' after
                  add_crosswalk).
-    normalize_ids : apply _norm_id to both sides (use for messy 2MASS strings).
+    normalize_ids : strip/upper-case and drop a leading '2M' on both sides
+                    (use for messy 2MASS string ids).
 
     Returns {cluster_name: np.ndarray of integer positions into df}. Clusters
     with zero matches are dropped (with no error).
     """
-    cat_ids = df[cat_id].to_numpy()
-    if normalize_ids:
-        cat_ids = _norm_id(cat_ids)
-    pos = {}
-    # build id -> row-position lookup (first occurrence wins)
+    import pandas as pd
+
+    def key(v):
+        """Common, exact key for int (Gaia source) ids and string (2MASS) ids."""
+        if v is None or v is pd.NA or (isinstance(v, float) and np.isnan(v)):
+            return None
+        if normalize_ids:
+            return str(v).strip().upper().replace("2M", "")
+        if isinstance(v, (int, np.integer)):      # python int and np.int64 -> same key
+            return int(v)
+        return str(v).strip()
+
+    # build id -> row-position lookup (first occurrence wins). dtype=object keeps
+    # nullable Int64 ids as exact python ints -- a plain .to_numpy() would cast
+    # an Int64-with-NA column to float64 and corrupt 19-digit Gaia source ids.
     lut = {}
-    for i, v in enumerate(cat_ids):
-        lut.setdefault(v, i)
+    for i, v in enumerate(df[cat_id].to_numpy(dtype=object, na_value=None)):
+        k = key(v)
+        if k is not None:
+            lut.setdefault(k, i)
 
     if not isinstance(members, dict):
         mem_df = members
@@ -205,10 +239,7 @@ def match_membership(df, members, *, cat_id="sdss_id", mem_cluster="cluster",
 
     out = {}
     for cl, ids in members.items():
-        ids = np.asarray(ids)
-        if normalize_ids:
-            ids = _norm_id(ids)
-        idx = [lut[v] for v in ids if v in lut]
+        idx = [lut[key(v)] for v in np.asarray(ids) if key(v) in lut]
         if idx:
             out[cl] = np.array(sorted(set(idx)))
     return out
@@ -231,6 +262,21 @@ def load_occam(path, *, prob_min=0.8, cluster_col="CLUSTER",
     df = df[df[prob_col] >= prob_min]
     return df.rename(columns={cluster_col: "cluster", id_col: "tmass_id"})[
         ["cluster", "tmass_id"]]
+
+
+def load_cantat_gaudin(path, *, prob_min=0.7, cluster_col="Cluster",
+                       id_col="GaiaDR2", prob_col="proba"):
+    """Cantat-Gaudin et al. (2020) open-cluster members -> DataFrame[cluster,
+    gaia_id]. Keyed by Gaia DR2 source_id, so crosswalk df to gaia_dr2_source_id.
+    `proba` is the membership probability (keep >= prob_min). Column names follow
+    the VizieR table (J/A+A/640/A1); adjust if your download differs.
+    """
+    from astropy.table import Table
+    t = Table.read(path)
+    df = t[[cluster_col, id_col, prob_col]].to_pandas()
+    df = df[df[prob_col] >= prob_min]
+    return df.rename(columns={cluster_col: "cluster", id_col: "gaia_id"})[
+        ["cluster", "gaia_id"]]
 
 
 def load_vasiliev_baumgardt(path, *, prob_min=0.9, cluster_col="Cluster",
