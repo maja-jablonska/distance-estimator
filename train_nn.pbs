@@ -53,6 +53,18 @@ NU="${NU:-4}"
 # beta-NLL weight for the Gaussian loss (Seitzer+22): 0.5 reduces the mean-fit bias
 # of plain NLL; set 0 to reproduce the pure-NLL run.
 BETA="${BETA:-0.5}"
+# optional calibration<->bias sweep: one gauss model per beta, sample prep reused.
+#   qsub -v BETA_SWEEP="0.2,0.3,0.5,0.7" train_nn.pbs
+BETA_SWEEP="${BETA_SWEEP:-}"
+
+# ---- Weights & Biases: log OFFLINE here (compute nodes have no internet); the
+#      copyq job sync_wandb.pbs uploads afterwards. Set USE_WANDB=0 to disable. ----
+USE_WANDB="${USE_WANDB:-1}"
+export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_DIR="${WANDB_DIR:-/scratch/mk27/${USER}/wandb}"
+WANDB_PROJECT="${WANDB_PROJECT:-spphot-nn}"
+RUN_NAME="${RUN_NAME:-nn-${PBS_JOBID:-local}}"
+mkdir -p "${WANDB_DIR}"
 
 # torch CPU threads (no-op on GPU)
 export OMP_NUM_THREADS="${PBS_NCPUS:-48}"
@@ -60,8 +72,14 @@ export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
 
 mkdir -p "$(dirname "${OUT}")"
 echo "[pbs] host=$(hostname) ncpus=${PBS_NCPUS:-?} parquet=${PARQUET}"
-echo "[pbs] out=${OUT} hidden=${HIDDEN} epochs=${EPOCHS} batch=${BATCH_SIZE} device=${DEVICE} loss=${LOSS} nu=${NU} beta=${BETA}"
+echo "[pbs] out=${OUT} hidden=${HIDDEN} epochs=${EPOCHS} batch=${BATCH_SIZE} device=${DEVICE} loss=${LOSS} nu=${NU} beta=${BETA} beta_sweep='${BETA_SWEEP}'"
 echo "[pbs] pixel_mask_dir=${PIXEL_MASK_DIR}"
+echo "[pbs] wandb: use=${USE_WANDB} mode=${WANDB_MODE} dir=${WANDB_DIR} project=${WANDB_PROJECT} run=${RUN_NAME}"
+
+# assemble optional flags safely under `set -u`
+EXTRA_ARGS=()
+[ "${USE_WANDB}" = "1" ] && EXTRA_ARGS+=(--wandb --wandb-project "${WANDB_PROJECT}" --run-name "${RUN_NAME}")
+[ -n "${BETA_SWEEP}" ] && EXTRA_ARGS+=(--beta-sweep "${BETA_SWEEP}")
 
 ${PYTHON_BIN} train_nn.py \
     --parquet "${PARQUET}" \
@@ -78,6 +96,8 @@ ${PYTHON_BIN} train_nn.py \
     --device "${DEVICE}" \
     --loss "${LOSS}" \
     --nu "${NU}" \
-    --beta "${BETA}"
+    --beta "${BETA}" \
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 
 echo "[pbs] done -> ${OUT}"
+echo "[pbs] sync wandb from copyq:  qsub -v WANDB_DIR=${WANDB_DIR} sync_wandb.pbs"

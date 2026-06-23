@@ -1,0 +1,56 @@
+#!/bin/bash
+#PBS -N wandb_sync
+#PBS -P mk27
+#PBS -q copyq
+#PBS -l ncpus=1
+#PBS -l mem=8GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
+#PBS -l wd
+#PBS -j oe
+#PBS -m abe
+#PBS -M maja.jablonska@anu.edu.au
+
+# --------------------------------------------------------------------------
+# Upload offline wandb runs to the cloud.
+#
+# Gadi compute queues (rsaa, normal, gpuvolta, ...) have NO outbound internet,
+# so train_nn.pbs logs with WANDB_MODE=offline into ${WANDB_DIR}/wandb. copyq is
+# the queue that DOES have internet, so this small job does the actual upload.
+#
+# Auth (pick one):
+#   * run `wandb login` once on a login node  -> writes ~/.netrc, used here, or
+#   * pass the key:  qsub -v WANDB_API_KEY=xxxxxxxx sync_wandb.pbs
+#
+# Submit AFTER training:
+#   qsub sync_wandb.pbs
+#   qsub -v WANDB_DIR=/scratch/mk27/$USER/wandb sync_wandb.pbs
+#
+# Or chain it to run automatically when training finishes (any exit status):
+#   tid=$(qsub train_nn.pbs)
+#   qsub -W depend=afterany:${tid} -v WANDB_DIR=/scratch/mk27/$USER/wandb sync_wandb.pbs
+# --------------------------------------------------------------------------
+
+set -euo pipefail
+
+export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}"
+export WANDB_DIR="${WANDB_DIR:-/scratch/mk27/${USER}/wandb}"
+export WANDB_MODE=online                       # this queue can reach the network
+
+# API key is optional if `wandb login` already wrote ~/.netrc
+if [ -n "${WANDB_API_KEY:-}" ]; then export WANDB_API_KEY; fi
+
+RUN_DIR="${WANDB_DIR}/wandb"
+echo "[pbs] host=$(hostname)  syncing offline runs under ${RUN_DIR}"
+
+# collect offline runs without tripping `set -e` when there are none
+shopt -s nullglob
+runs=("${RUN_DIR}"/offline-run-* "${RUN_DIR}"/run-*)
+if [ ${#runs[@]} -eq 0 ]; then
+    echo "[pbs] no offline runs found in ${RUN_DIR} — nothing to sync"
+    exit 0
+fi
+
+echo "[pbs] ${#runs[@]} run dir(s) to sync"
+${PYTHON_BIN} -m wandb sync "${runs[@]}"
+echo "[pbs] wandb sync done"

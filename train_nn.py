@@ -128,7 +128,7 @@ def standardize_fit(A):
 # train / predict
 # ----------------------------------------------------------------------
 def train_fold(feats, train_mask, plx, err, mu, sd, *, loss_fn, hidden, dropout, lr,
-               weight_decay, epochs, batch_size, device, seed, label):
+               weight_decay, epochs, batch_size, device, seed, label, log_cb=None):
     """Train a HetMLP on the stars in train_mask. Features are standardized per batch
     with the supplied (mu, sd) — the train-fold stats — so nothing leaks from the
     held-out fold."""
@@ -172,6 +172,8 @@ def train_fold(feats, train_mask, plx, err, mu, sd, *, loss_fn, hidden, dropout,
             opt.step()
             running += loss.item() * bidx.numel()
         sched.step()
+        if log_cb is not None:
+            log_cb(label, ep + 1, running / n, sched.get_last_lr()[0])
         if ep == 0 or (ep + 1) % 10 == 0 or ep == epochs - 1:
             log(f"    [{label}] epoch {ep+1}/{epochs}  NLL={running/n:.4f}  "
                 f"lr={sched.get_last_lr()[0]:.2e}  ({time.time()-t0:.0f}s)")
@@ -196,6 +198,25 @@ def predict_nn(model, feats, idx, mu, sd, device, batch=65536):
             out_m[i:i + batch] = m.cpu().numpy()
             out_s[i:i + batch] = sig.cpu().numpy()
     return out_m, out_s
+
+
+# ----------------------------------------------------------------------
+# optional Weights & Biases logging (offline-friendly)
+# ----------------------------------------------------------------------
+def _init_wandb(args, tag, config):
+    """Start a wandb run for one config, or return None if --wandb is off / wandb
+    is missing. Offline mode is controlled by WANDB_MODE=offline in the PBS job
+    (compute nodes have no internet); the copyq sync job uploads afterwards."""
+    if not getattr(args, "wandb", False):
+        return None
+    try:
+        import wandb
+    except ImportError:
+        log("wandb not installed -> skipping logging")
+        return None
+    name = f"{args.run_name}-{tag}" if args.run_name else tag
+    return wandb.init(project=args.wandb_project, name=name,
+                      group=args.run_name or None, config=config, reinit=True)
 
 
 # ----------------------------------------------------------------------
@@ -235,6 +256,12 @@ def main():
                     help="comma-separated betas, e.g. '0.2,0.3,0.5,0.7'. Trains one "
                          "gauss model per beta, REUSING the sample prep once; writes "
                          "<out>_gauss-beta<b>.parquet for each. Overrides --loss/--beta.")
+    ap.add_argument("--wandb", action="store_true",
+                    help="log to Weights & Biases (one run per config). On compute "
+                         "nodes set WANDB_MODE=offline and sync later from copyq.")
+    ap.add_argument("--wandb-project", default="spphot-nn")
+    ap.add_argument("--run-name", default=None,
+                    help="wandb run name / sweep group; each config appends its tag")
     args = ap.parse_args()
     import pandas as pd
     import spphot_eval as E
@@ -280,11 +307,18 @@ def main():
                 f"gauss-beta{beta:g}")
 
     def run_config(loss_fn, std_factor, tag, out_path, model_out, meta):
+        run = _init_wandb(args, tag, {**hp, **meta, "std_factor": std_factor,
+                                      "snr_min": args.snr_min, "bad_frac": args.bad_frac,
+                                      "n_features": int(feats.shape[1]),
+                                      "n_train": int(train_k.sum())})
+        cb = ((lambda lbl, ep, nll, lr: run.log({f"{lbl}/nll": nll, f"{lbl}/lr": lr}))
+              if run is not None else None)
+
         def fit(train_mask, label):
             mu, sd = standardize_fit(feats[train_mask])
             log(f"  training {label}: {int(train_mask.sum())} stars")
             model = train_fold(feats, train_mask, plx_k, err_k, mu, sd,
-                               loss_fn=loss_fn, label=label, **hp)
+                               loss_fn=loss_fn, label=label, log_cb=cb, **hp)
             return model, mu, sd
 
         log(f"=== config {tag}: training models ===")
@@ -341,16 +375,33 @@ def main():
                     "sample": samp_k[train_k], "id": ids_k[train_k]}
         cat, cat_in = make_cat(plx_sp, err_sp), make_cat(plx_in, err_in)
         label = f"het-NN ({tag})"
+        rep = E.evaluate(cat, label=label)
+        rep_in = E.evaluate(cat_in, label="in-fold")
+        gap = E.overfit_gap(rep_in, rep)
+        bins, c = E.calibrate(cat)
         print()
-        E.print_report(E.evaluate(cat, label=label))
-        E.print_overfit_gap(E.evaluate(cat_in, label="in-fold"),
-                            E.evaluate(cat, label="held-out"))
-        E.print_calibration(*E.calibrate(cat))
+        E.print_report(rep)
+        E.print_overfit_gap(rep_in, rep)
+        E.print_calibration(bins, c)
         print()
         for f in ("A", "B"):
             E.print_report(E.evaluate(cat, fold=f, label=label))
             E.print_calibration(*E.calibrate(cat, fold=f))
             print()
+
+        if run is not None:
+            summary = {
+                "scatter": rep["robust_frac_scatter"],
+                "bias": rep["median_frac_resid"],
+                "chi2_mean": rep["chi2_mean_chi2"],
+                "chi2_robust": rep["chi2_robust_chi2"],
+                "median_spec_err_frac": rep["median_spec_err_frac"],
+                "overfit_gap_pp": gap["gap_pp"],
+                "recal_factor": c,
+            }
+            run.log(summary)
+            run.summary.update(summary)
+            run.finish()
 
     # ---- build the run list: a single config, or a gauss beta sweep ----
     if args.beta_sweep:
