@@ -9,7 +9,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from spphot_eval import hi_snr_mask, fractional_residuals, robust_scatter
+from spphot_eval import (hi_snr_mask, fractional_residuals, robust_scatter,
+                         bias_bins)
 
 
 def fig2(cat, path="fig2.png", snr_thresh=20.0, title="Figure 2"):
@@ -36,6 +37,51 @@ def fig2(cat, path="fig2.png", snr_thresh=20.0, title="Figure 2"):
 
     s = robust_scatter(fractional_residuals(plx_sp[m], plx_a[m]))
     fig.suptitle(f"{title} — hi-S/N robust scatter = {100*s:.1f}%")
+    plt.tight_layout()
+    plt.savefig(path, dpi=120)
+    plt.close()
+    return path
+
+
+def bias_localization(cats, path="bias_loc.png", by_key=None,
+                      by_label="pred_err_frac", snr_thresh=20.0, nbins=8,
+                      title="bias localization"):
+    """Plot median frac residual (bias) vs a chosen axis, one line per model.
+
+    cats : a single catalog dict, or {label: cat} to overlay (e.g. the beta
+           sweep, or fold A vs B). by_key names the per-star column to bin on
+           (e.g. 'r_bj'); default None bins on the predicted err frac so the
+           x-axis matches calibration/bias_bins. The top panel is bias% (the
+           thing that should be flat at 0); the bottom is in-bin robust scatter%
+           for context. A bias trend toward one end => regime-localized bias
+           (de-bias there or raise beta); a flat offset => one global correction.
+    """
+    if not isinstance(cats, dict):
+        cats = {"model": cats}
+
+    fig, (ax_b, ax_s) = plt.subplots(2, 1, figsize=(7, 7), sharex=True,
+                                     gridspec_kw={"height_ratios": [2, 1]})
+    for i, (lab, cat) in enumerate(cats.items()):
+        by = cat.get(by_key) if by_key else None
+        bins, axis_lab = bias_bins(cat["plx_sp"], cat["plx_a"], cat["err_a"],
+                                   cat["err_sp"], by=by, by_label=by_label,
+                                   nbins=nbins, snr_thresh=snr_thresh)
+        if not bins:
+            continue
+        x  = [b["axis_med"] for b in bins]
+        bi = [100 * b["bias"] for b in bins]
+        sc = [100 * b["scatter"] for b in bins]
+        c = f"C{i}"
+        glob = 100 * np.median([b["bias"] for b in bins])
+        ax_b.plot(x, bi, "o-", color=c, label=f"{lab} (med {glob:+.1f}%)")
+        ax_s.plot(x, sc, "o-", color=c)
+
+    ax_b.axhline(0, color="k", lw=1, ls=":")
+    ax_b.set(ylabel="bias  (median frac resid) [%]", title=title)
+    ax_b.legend(fontsize=8)
+    ax_s.set(xlabel=axis_lab, ylabel="robust scatter [%]")
+    if by_key is None:
+        ax_s.set_xlabel(f"{axis_lab}  (predicted err_sp/plx_sp)")
     plt.tight_layout()
     plt.savefig(path, dpi=120)
     plt.close()
