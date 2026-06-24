@@ -193,6 +193,50 @@ def print_calibration(bins, c=None):
 
 
 # ----------------------------------------------------------------------
+# bias localization (where does the median frac residual live?)
+# ----------------------------------------------------------------------
+# The beta-NLL down-weights the mean head's gradient on high-variance stars by
+# var**(beta-1), so at LOW beta the mean underfits the faint/scattered regime and
+# the global median_frac_resid picks up a net offset. This bins that residual
+# along a chosen axis to see whether the bias is FLAT (a global offset correction
+# fixes it) or CONCENTRATED at one end (the high-err / faint tail -> de-bias just
+# there, or raise beta). Default axis is the predicted err frac, so the table
+# lines up row-for-row with calibration_bins(); pass `by`/`by_label` (e.g. the BJ
+# distance r_med_photogeo_pc, or a crossmatched Teff/H mag) to bin on anything.
+def bias_bins(plx_sp, plx_a, err_a, err_sp, by=None, by_label="pred_err_frac",
+              offset=0.0, nbins=8, snr_thresh=20.0):
+    probe = hi_snr_mask(plx_a, err_a, snr_thresh)
+    axis = (err_sp / plx_sp) if by is None else np.asarray(by, float)
+    m = probe & np.isfinite(axis) & (plx_a != 0) & np.isfinite(plx_sp)
+    plx_sp, plx_a, axis = plx_sp[m], plx_a[m], axis[m]
+    frac = (plx_sp - (plx_a + offset)) / plx_a
+    edges = np.quantile(axis, np.linspace(0, 1, nbins + 1))
+    edges[-1] = np.inf
+    out = []
+    for i in range(nbins):
+        b = (axis >= edges[i]) & (axis < edges[i + 1])
+        if b.sum() < 20:
+            continue
+        out.append({
+            "n":        int(b.sum()),
+            "axis_med": float(np.median(axis[b])),
+            "bias":     float(np.median(frac[b])),       # median frac resid in bin
+            "scatter":  float(robust_scatter(frac[b])),  # robust frac scatter in bin
+        })
+    return out, by_label
+
+
+def print_bias_bins(result):
+    bins, by_label = result
+    print(f"  bias localization (high-S/N probe, binned by {by_label}):")
+    print(f"    {by_label[:9]:>9}   bias%   scat%      N")
+    for r in bins:
+        print(f"    {r['axis_med']:9.3f}  {100*r['bias']:+6.2f}  {100*r['scatter']:5.2f}  {r['n']:6d}")
+    print("    (flat bias column = global offset fixes it; trend = bias lives in"
+          " one regime -> de-bias there or raise beta)")
+
+
+# ----------------------------------------------------------------------
 # top-level report
 # ----------------------------------------------------------------------
 def evaluate(cat, snr_thresh=20.0, offset=0.0, fold=None, label="model"):
