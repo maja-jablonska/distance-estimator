@@ -10,7 +10,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from spphot_eval import (hi_snr_mask, fractional_residuals, robust_scatter,
-                         bias_bins)
+                         bias_bins, zscore, sharpness)
 
 
 def fig2(cat, path="fig2.png", snr_thresh=20.0, title="Figure 2"):
@@ -82,6 +82,69 @@ def bias_localization(cats, path="bias_loc.png", by_key=None,
     ax_s.set(xlabel=axis_lab, ylabel="robust scatter [%]")
     if by_key is None:
         ax_s.set_xlabel(f"{axis_lab}  (predicted err_sp/plx_sp)")
+    plt.tight_layout()
+    plt.savefig(path, dpi=120)
+    plt.close()
+    return path
+
+
+def zscore_diagnostic(cats, path="zscore.png", offset=0.0,
+                      title="z-score honesty"):
+    """Histogram + QQ of z = (plx_sp-plx_a)/sqrt(err_sp^2+err_a^2), one model per
+    color. Honest Gaussian errors -> z ~ N(0,1): the dashed curve / diagonal.
+    Core off-center = bias; core wider than N(0,1) = overconfident; shoulders
+    above the diagonal at the ends = the outlier tail (-> Student-t). The legend
+    reports the robust width of z (1 if calibrated). cats: a cat dict or
+    {label: cat}. Uses scipy for the normal pdf/ppf (present in any astro stack).
+    """
+    import scipy.stats as ss
+    if not isinstance(cats, dict):
+        cats = {"model": cats}
+    fig, (ax_h, ax_q) = plt.subplots(1, 2, figsize=(12, 5))
+    xx = np.linspace(-5, 5, 200)
+    ax_h.plot(xx, ss.norm.pdf(xx), "k--", lw=1, label="N(0,1)")
+    q = np.linspace(0.005, 0.995, 120)
+    for i, (lab, cat) in enumerate(cats.items()):
+        z = zscore(cat["plx_sp"], cat["plx_a"], cat["err_a"], cat["err_sp"], offset)
+        w = robust_scatter(z)                       # ~1 if honest
+        tail = 100 * np.mean(np.abs(z) > 3)
+        ax_h.hist(z, bins=np.linspace(-5, 5, 80), density=True, histtype="step",
+                  color=f"C{i}", label=f"{lab} (w={w:.2f}, |z|>3 {tail:.1f}%)")
+        ax_q.plot(ss.norm.ppf(q), np.quantile(np.clip(z, -12, 12), q),
+                  color=f"C{i}", label=lab)
+    ax_h.set(xlim=(-5, 5), xlabel="z", ylabel="density", title=title)
+    ax_h.legend(fontsize=8)
+    ax_q.plot([-4, 4], [-4, 4], "k--", lw=1)
+    ax_q.set(xlim=(-4, 4), ylim=(-6, 6), xlabel="theoretical N(0,1) quantile",
+             ylabel="empirical z quantile", title="QQ")
+    ax_q.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(path, dpi=120)
+    plt.close()
+    return path
+
+
+def dist_vs_bj(series, path="dist_vs_bj.png", lim=8.0, title="spec vs BJ distance"):
+    """Spec distance vs Bailer-Jones photogeo distance (a quasi-independent
+    estimator -- prior-dominated where the Gaia parallax is noisy, so it probes
+    the far stars Gaia-based eval cannot referee). series: {label: (dist_sp_kpc,
+    r_bj_kpc)}. Panel title reports median offset and robust frac scatter."""
+    n = len(series)
+    fig, axes = plt.subplots(1, n, figsize=(4 * n, 4), sharex=True, sharey=True,
+                             squeeze=False)
+    for ax, (lab, (d_sp, r_bj)) in zip(axes[0], series.items()):
+        d_sp, r_bj = np.asarray(d_sp, float), np.asarray(r_bj, float)
+        m = np.isfinite(d_sp) & np.isfinite(r_bj) & (d_sp > 0) & (r_bj > 0)
+        d_sp, r_bj = d_sp[m], r_bj[m]
+        ax.hexbin(r_bj, d_sp, gridsize=60, bins="log", extent=(0, lim, 0, lim),
+                  cmap="viridis", rasterized=True)
+        ax.plot([0, lim], [0, lim], "r--", lw=1)
+        frac = (d_sp - r_bj) / r_bj
+        ax.set(xlabel="r_BJ [kpc]",
+               title=f"{lab}\nmed {100*np.median(frac):+.1f}%  "
+                     f"rob {100*robust_scatter(frac):.1f}%")
+    axes[0][0].set_ylabel("dist_sp [kpc]")
+    fig.suptitle(title)
     plt.tight_layout()
     plt.savefig(path, dpi=120)
     plt.close()

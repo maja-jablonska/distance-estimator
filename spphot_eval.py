@@ -237,6 +237,66 @@ def print_bias_bins(result):
 
 
 # ----------------------------------------------------------------------
+# distributional honesty: z-score, coverage, sharpness
+# ----------------------------------------------------------------------
+# The robust scatter/chi2 above DELIBERATELY ignore the tail (that is why
+# mean_chi2 >> robust_chi2). These three look at the whole predictive
+# distribution: z exposes the tail's shape, coverage turns it into a number a
+# referee reads, and sharpness asks whether the per-star error head is doing any
+# real work or whether a single constant error would do as well.
+def zscore(plx_sp, plx_a, err_a, err_sp, offset=0.0):
+    """Normalized residual z = (plx_sp - (plx_a+offset)) / sqrt(err_sp^2+err_a^2).
+
+    Honest, Gaussian errors -> z ~ N(0,1). One histogram/QQ then shows all three
+    failure modes at once: a shifted center (bias), a width != 1 (the same
+    over/under-confidence calibration_bins measures) and fat shoulders (the
+    outlier tail that drives mean_chi2 >> robust_chi2). Fat shoulders with a
+    well-centered, unit-width core is the empirical case for the Student-t head.
+    """
+    z = (plx_sp - (plx_a + offset)) / np.sqrt(err_sp**2 + err_a**2)
+    return z[np.isfinite(z)]
+
+
+def coverage(plx_sp, plx_a, err_a, err_sp, offset=0.0, levels=(1.0, 2.0, 3.0)):
+    """Empirical fraction of stars with Gaia within k*sigma of plx_sp, vs the
+    nominal Gaussian 68.3 / 95.4 / 99.7%. emp < nominal -> overconfident."""
+    from math import erf, sqrt
+    z = np.abs(zscore(plx_sp, plx_a, err_a, err_sp, offset))
+    return [{"k": float(k), "emp": float(np.mean(z <= k)),
+             "nominal": float(erf(k / sqrt(2.0)))} for k in levels]
+
+
+def print_coverage(rows):
+    print("  coverage (Gaia within k*sigma of plx_sp; honest Gaussian -> nominal):")
+    print("     k     empirical  nominal")
+    for r in rows:
+        flag = "  <- overconfident" if r["emp"] < r["nominal"] - 0.01 else ""
+        print(f"    {r['k']:.0f}sig    {100*r['emp']:5.1f}%    {100*r['nominal']:5.1f}%{flag}")
+
+
+def _spearman(x, y):
+    """Spearman rho without scipy: Pearson correlation of the ranks. Ties get
+    ordinal (not averaged) ranks -- fine for continuous err_sp/residuals."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    rx = np.argsort(np.argsort(x)).astype(float)
+    ry = np.argsort(np.argsort(y)).astype(float)
+    rx -= rx.mean(); ry -= ry.mean()
+    denom = np.sqrt((rx @ rx) * (ry @ ry))
+    return float(rx @ ry / denom) if denom > 0 else np.nan
+
+
+def sharpness(plx_sp, plx_a, err_a, err_sp, snr_thresh=20.0):
+    """Spearman rho between predicted err_sp and realized |residual| on the
+    hi-S/N probe (where err_sp carries the scatter). rho ~ 0 means the
+    heteroscedastic head is decorative -- a constant error would score as well;
+    a clearly positive rho means beta is buying real per-star uncertainty."""
+    probe = hi_snr_mask(plx_a, err_a, snr_thresh)
+    resid = np.abs(plx_sp - plx_a)
+    m = probe & np.isfinite(resid) & np.isfinite(err_sp) & (err_sp > 0)
+    return _spearman(err_sp[m], resid[m])
+
+
+# ----------------------------------------------------------------------
 # top-level report
 # ----------------------------------------------------------------------
 def evaluate(cat, snr_thresh=20.0, offset=0.0, fold=None, label="model"):
