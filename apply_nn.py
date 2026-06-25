@@ -60,7 +60,9 @@ def load_bundle(model_path, pixel_mask_dir=None, device="auto"):
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ckpt = torch.load(model_path, map_location=device)
+    # weights_only=False: our own train_nn.py checkpoint stores numpy arrays
+    # (good_pixel_mask, mu/sd) that PyTorch 2.6's restricted unpickler rejects.
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
     good = np.asarray(ckpt["good_pixel_mask"], bool)
     mu = np.asarray(ckpt["mu"], np.float32)
     sd = np.asarray(ckpt["sd"], np.float32)
