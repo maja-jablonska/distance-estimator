@@ -1,0 +1,101 @@
+#!/bin/bash
+#PBS -N spphot_cluster_prep
+#PBS -P mk27
+#PBS -q rsaa
+#PBS -l ncpus=8
+#PBS -l mem=64GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
+#PBS -l wd
+#PBS -j oe
+#PBS -m abe
+#PBS -M maja.jablonska@anu.edu.au
+
+# --------------------------------------------------------------------------
+# Cluster spectra prep (cluster.ipynb -> apply_nn.pbs).
+#
+# cluster.ipynb writes per-cluster astra METADATA parquets
+# (<cluster>_astra_matched.parquet, keyed by sdss_id). This job streams the big
+# spectra parquet, pulls each cluster's member spectra, applies the data-quality
+# cuts (spectrum_flags==0 + one clean spectrum per star), and writes one spectra
+# parquet per cluster into OUT_DIR -- exactly the CLUSTER_DIR apply_nn.pbs wants.
+#
+# Submit:
+#   qsub -v CLUSTER_DIR=/scratch/mk27/$USER/clusters/matched_astra_parquets \
+#        prepare_cluster_spectra.pbs
+#
+#   # also run inference + the cluster test in the same job:
+#   qsub -v CLUSTER_DIR=...,RUN_APPLY=1,MODEL=/scratch/mk27/$USER/..._model.pt \
+#        prepare_cluster_spectra.pbs
+# --------------------------------------------------------------------------
+
+set -euo pipefail
+export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}"
+
+SRC="${SRC:-/scratch/mk27/mj8805}"
+DATA="${DATA:-${SRC}/bulge-ages-and-orbits/data}"
+
+# inputs
+CLUSTER_DIR="${CLUSTER_DIR:-${SRC}/distance-estimator/clusters/matched_astra_parquets}"
+SPECTRA="${SPECTRA:-${DATA}/spectra_infer_parallax_zpt.parquet}"
+ID_COL="${ID_COL:-sdss_id}"
+SNR_MIN="${SNR_MIN:-0}"           # optional snr floor; 0 = off (training-only cut)
+KEEP_FLAGGED="${KEEP_FLAGGED:-0}" # 1 = skip the spectrum_flags==0 cut
+
+# output dir of per-cluster spectra parquets (== apply_nn.pbs CLUSTER_DIR)
+OUT_DIR="${OUT_DIR:-${SRC}/distance-estimator/clusters/spectra_per_cluster}"
+
+# optional: chain inference + cluster test (apply_nn.pbs body) in this same job
+RUN_APPLY="${RUN_APPLY:-0}"
+ALLSTAR="${ALLSTAR:-${DATA}/astraAllStarASPCAP-0.8.0.fits}"
+PIXEL_MASK_DIR="${PIXEL_MASK_DIR:-${SRC}/pixel_mask}"
+MODEL="${MODEL:-/scratch/mk27/${USER}/spphot_nn_results_model.pt}"
+APPLY_OUT_DIR="${APPLY_OUT_DIR:-/scratch/mk27/${USER}/cluster_nn}"
+OFFSET="${OFFSET:-0.0}"           # set if spectra parquet lacks 'zeropoint'
+ERR_SCALE="${ERR_SCALE:-1.0}"
+PLX_G="${PLX_G:-plx}"
+
+export OMP_NUM_THREADS="${PBS_NCPUS:-8}"
+export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
+
+echo "[pbs] host=$(hostname)"
+echo "[pbs] cluster meta=${CLUSTER_DIR}"
+echo "[pbs] spectra=${SPECTRA}"
+echo "[pbs] -> per-cluster spectra=${OUT_DIR}  run_apply=${RUN_APPLY}"
+
+flags=(--cluster-dir "${CLUSTER_DIR}" --spectra "${SPECTRA}"
+       --out-dir "${OUT_DIR}" --id-col "${ID_COL}" --snr-min "${SNR_MIN}")
+[ "${KEEP_FLAGGED}" = "1" ] && flags+=(--keep-flagged)
+
+${PYTHON_BIN} prepare_cluster_spectra.py "${flags[@]}"
+
+if [ "${RUN_APPLY}" != "1" ]; then
+    echo "[pbs] prep done -> feed ${OUT_DIR} to apply_nn.pbs as CLUSTER_DIR"
+    exit 0
+fi
+
+# ---- chained inference + cluster test (mirrors apply_nn.pbs) ----
+mkdir -p "${APPLY_OUT_DIR}"
+echo "[pbs] === applying NN + cluster test ===  model=${MODEL}"
+shopt -s nullglob
+files=("${OUT_DIR}"/*.parquet)
+if [ ${#files[@]} -eq 0 ]; then
+    echo "[pbs] no per-cluster spectra parquets in ${OUT_DIR}"; exit 1
+fi
+for f in "${files[@]}"; do
+    name="$(basename "${f}" .parquet)"
+    echo "[pbs] --- ${name} ---"
+    ${PYTHON_BIN} apply_nn.py \
+        --model "${MODEL}" \
+        --parquet "${f}" \
+        --allstar "${ALLSTAR}" \
+        --pixel-mask-dir "${PIXEL_MASK_DIR}" \
+        --cluster-name "${name}" \
+        --out "${APPLY_OUT_DIR}/${name}_nn.parquet"
+done
+
+echo "[pbs] === cluster test ==="
+${PYTHON_BIN} run_cluster_test.py "${APPLY_OUT_DIR}"/*_nn.parquet \
+    --offset "${OFFSET}" --err-scale "${ERR_SCALE}" --plx-g "${PLX_G}"
+
+echo "[pbs] done -> ${APPLY_OUT_DIR}"

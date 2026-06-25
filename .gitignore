@@ -3,6 +3,7 @@ spphot_data/
 *.npz
 xmatch.fits
 allStar*.fits
+clusters/
 
 # python
 __pycache__/

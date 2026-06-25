@@ -1,0 +1,58 @@
+#!/bin/bash
+#PBS -N spphot_run_clusters
+#PBS -P mk27
+#PBS -q rsaa
+#PBS -l ncpus=16
+#PBS -l mem=64GB
+#PBS -l walltime=03:00:00
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
+#PBS -l wd
+#PBS -j oe
+#PBS -m abe
+#PBS -M maja.jablonska@anu.edu.au
+
+# --------------------------------------------------------------------------
+# End to end: prepare per-cluster spectra, apply the NN checkpoint to ALL
+# clusters (checkpoint loaded once), and run the Hogg+18 Fig-4 cluster test.
+# Wraps run_clusters.py.
+#
+# Submit:
+#   qsub -v CLUSTER_DIR=/scratch/mk27/$USER/clusters/matched_astra_parquets,\
+#MODEL=/scratch/mk27/$USER/spphot_nn_results_model.pt run_clusters.pbs
+# --------------------------------------------------------------------------
+
+set -euo pipefail
+export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}"
+
+SRC="${SRC:-/scratch/mk27/mj8805}"
+DATA="${DATA:-${SRC}/bulge-ages-and-orbits/data}"
+
+CLUSTER_DIR="${CLUSTER_DIR:-${SRC}/distance-estimator/clusters/matched_astra_parquets}"
+SPECTRA="${SPECTRA:-${DATA}/spectra_infer_parallax_zpt.parquet}"
+ALLSTAR="${ALLSTAR:-${DATA}/astraAllStarASPCAP-0.8.0.fits}"
+PIXEL_MASK_DIR="${PIXEL_MASK_DIR:-${SRC}/pixel_mask}"
+MODEL="${MODEL:-/scratch/mk27/${USER}/spphot_nn_results_model.pt}"
+WORK_DIR="${WORK_DIR:-/scratch/mk27/${USER}/cluster_run}"
+
+ID_COL="${ID_COL:-sdss_id}"
+SNR_MIN="${SNR_MIN:-0}"
+KEEP_FLAGGED="${KEEP_FLAGGED:-0}"
+OFFSET="${OFFSET:-0.0}"           # set if spectra parquet lacks 'zeropoint'
+ERR_SCALE="${ERR_SCALE:-1.0}"
+PLX_G="${PLX_G:-plx}"
+
+export OMP_NUM_THREADS="${PBS_NCPUS:-16}"
+export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
+
+echo "[pbs] host=$(hostname) model=${MODEL}"
+echo "[pbs] cluster meta=${CLUSTER_DIR} -> work=${WORK_DIR}"
+
+flags=(--cluster-dir "${CLUSTER_DIR}" --spectra "${SPECTRA}" --allstar "${ALLSTAR}"
+       --model "${MODEL}" --pixel-mask-dir "${PIXEL_MASK_DIR}" --work-dir "${WORK_DIR}"
+       --id-col "${ID_COL}" --snr-min "${SNR_MIN}"
+       --offset "${OFFSET}" --err-scale "${ERR_SCALE}" --plx-g "${PLX_G}")
+[ "${KEEP_FLAGGED}" = "1" ] && flags+=(--keep-flagged)
+
+${PYTHON_BIN} run_clusters.py "${flags[@]}"
+
+echo "[pbs] done -> ${WORK_DIR}"
