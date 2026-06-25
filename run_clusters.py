@@ -99,9 +99,17 @@ def main():
                   require_clean=not args.keep_flagged, snr_min=args.snr_min,
                   batch_rows=args.batch_rows)
 
+    import pyarrow.parquet as pq
     cluster_files = sorted(glob.glob(str(spectra_dir / "*.parquet")))
+    # drop empty parquets (clusters with no member spectra): apply_to_parquet can't
+    # infer the spectral grid from zero rows and would trip the saved-mask assertion
+    nonempty = [f for f in cluster_files if pq.ParquetFile(f).metadata.num_rows > 0]
+    for f in cluster_files:
+        if f not in nonempty:
+            R.log(f"skipping {Path(f).stem}: 0 spectra")
+    cluster_files = nonempty
     if not cluster_files:
-        raise SystemExit(f"no prepared spectra parquets in {spectra_dir}")
+        raise SystemExit(f"no non-empty prepared spectra parquets in {spectra_dir}")
 
     # 2) load the checkpoint ONCE, infer every cluster -----------------------------
     if args.skip_apply:

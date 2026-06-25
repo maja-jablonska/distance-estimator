@@ -236,9 +236,17 @@ def prepare(cluster_dir, spectra_path, out_dir, *, id_col="sdss_id",
     for name, ids in members.items():
         pos = [spec_by_id[i] for i in ids.tolist() if i in spec_by_id]
         sub = spec.iloc[pos]
-        out_path = out_dir / f"{name}.parquet"
-        sub.to_parquet(out_path, index=False)
         summary.append((name, len(ids), len(sub)))
+        out_path = out_dir / f"{name}.parquet"
+        if len(sub) == 0:
+            # don't write an empty parquet: build_lnflux_streaming has no batch to
+            # infer the spectral grid from and trips the saved-mask assertion. Also
+            # clear a stale empty file from a previous run so --skip-prep stays clean.
+            if out_path.exists():
+                out_path.unlink()
+            log(f"  {name:<24}     0/{len(ids):<5} members with spectra -> SKIP (no spectra)")
+            continue
+        sub.to_parquet(out_path, index=False)
         log(f"  {name:<24} {len(sub):>5}/{len(ids):<5} members with spectra "
             f"-> {out_path.name}")
 
