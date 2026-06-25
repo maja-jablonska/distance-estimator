@@ -59,21 +59,29 @@ def robust_scatter(x):
     return 1.48 * np.median(np.abs(x - np.median(x)))
 
 
-def fractional_residuals(plx_sp, plx_a):
-    """(sp - a)/a. Defined on the high-S/N probe where a is meaningful."""
-    return (plx_sp - plx_a) / plx_a
+def fractional_residuals(plx_sp, plx_a, offset=0.0):
+    """(sp - (a+offset))/a. Defined on the high-S/N probe where a is meaningful.
+
+    SIGN CONVENTION (shared by every residual in this module): the residual is
+    spec MINUS offset-adjusted Gaia, so +bias means the spec parallax OVER-predicts
+    (distances too short). offset is the Gaia zero-point added to the Gaia side, so
+    it enters identically here, in chi2_stats, recalibration_factor,
+    calibration_bins, bias_bins and zscore.
+    """
+    return (plx_sp - (plx_a + offset)) / plx_a
 
 
 def chi2_stats(plx_sp, plx_a, err_a, err_sp, offset=0.0):
     """Per-star chi (sp predicting offset-adjusted Gaia) under combined errors.
 
-    chi_n = (plx_a + offset - plx_sp) / sqrt(err_a^2 + err_sp^2)
+    chi_n = (plx_sp - (plx_a + offset)) / sqrt(err_a^2 + err_sp^2)   # spec - adj Gaia
 
     Returns mean chi2 (should ~1 if errors honest) and a robust analogue.
-    Paper I found mean chi2 > 1 (outlier-driven) but robust version ~ ok.
-    A good heteroscedastic NN should push BOTH toward 1.
+    Paper I found mean chi2 > 1 (outlier-driven) but robust version ~ ok. The
+    het-Gaussian head + scalar recal fixes the ROBUST chi2; only the Student-t
+    head genuinely shrinks the tail that keeps mean chi2 > 1 (see recal note).
     """
-    chi = (plx_a + offset - plx_sp) / np.sqrt(err_a**2 + err_sp**2)
+    chi = (plx_sp - (plx_a + offset)) / np.sqrt(err_a**2 + err_sp**2)
     chi = chi[np.isfinite(chi)]
     return {
         "mean_chi2":   float(np.mean(chi**2)),
@@ -121,8 +129,12 @@ def recalibration_factor(plx_sp, plx_a, err_a, err_sp, offset=0.0, target=1.0):
     catalog. A single scalar only fully fixes a FLAT miscalibration; if
     calibration_bins() shows a tilt, prefer a magnitude-dependent recal or a
     lower beta-NLL.
+
+    NOTE: targets the ROBUST (MAD) chi width by construction, so it ignores the
+    tail -- after recal, robust_chi2 -> 1 but mean_chi2 stays >> 1. Do not credit
+    this scalar with any mean-chi2 improvement; that is the Student-t head's job.
     """
-    resid = plx_a + offset - plx_sp
+    resid = plx_sp - (plx_a + offset)             # spec - adj Gaia (module convention)
     m = np.isfinite(resid) & np.isfinite(err_a) & np.isfinite(err_sp) & (err_sp > 0)
     resid, err_a, err_sp = resid[m], err_a[m], err_sp[m]
     lo, hi = 1e-3, 100.0
@@ -285,13 +297,13 @@ def _spearman(x, y):
     return float(rx @ ry / denom) if denom > 0 else np.nan
 
 
-def sharpness(plx_sp, plx_a, err_a, err_sp, snr_thresh=20.0):
+def sharpness(plx_sp, plx_a, err_a, err_sp, offset=0.0, snr_thresh=20.0):
     """Spearman rho between predicted err_sp and realized |residual| on the
     hi-S/N probe (where err_sp carries the scatter). rho ~ 0 means the
     heteroscedastic head is decorative -- a constant error would score as well;
     a clearly positive rho means beta is buying real per-star uncertainty."""
     probe = hi_snr_mask(plx_a, err_a, snr_thresh)
-    resid = np.abs(plx_sp - plx_a)
+    resid = np.abs(plx_sp - (plx_a + offset))
     m = probe & np.isfinite(resid) & np.isfinite(err_sp) & (err_sp > 0)
     return _spearman(err_sp[m], resid[m])
 
@@ -315,7 +327,7 @@ def evaluate(cat, snr_thresh=20.0, offset=0.0, fold=None, label="model"):
     plx_sp, err_sp = cat["plx_sp"][sel], cat["err_sp"][sel]
 
     probe = hi_snr_mask(plx_a, err_a, snr_thresh)
-    frac = fractional_residuals(plx_sp[probe], plx_a[probe])
+    frac = fractional_residuals(plx_sp[probe], plx_a[probe], offset)
 
     rep = {
         "label": label,

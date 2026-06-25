@@ -6,8 +6,10 @@ Same sample, features, zero-point, pixel masks and A/B split as run_full_gadi.py
 (it reuses run_full_gadi.prepare_sample), but instead of the linear exp(X@theta)
 fit it trains an MLP that outputs BOTH a parallax AND a per-star error. A learned,
 per-star sigma is exactly what the linear baseline lacks: with a single constant
-fractional error the eval shows mean chi2 ~ 2.6 (outlier-driven); a heteroscedastic
-model can push it toward 1 and usually tightens the scatter too.
+fractional error the eval shows mean chi2 ~ 2.6 (outlier-driven). A heteroscedastic
+Gaussian head + scalar recal makes the ROBUST chi2 ~ 1 and usually tightens the
+scatter, but leaves mean chi2 >> 1 -- that outlier tail is only shrunk by the
+Student-t head (studentt_nll). Credit each claim to the right mechanism.
 
 Model (features x = standardized [photometry | ln-flux on the good pixels]):
     body  = MLP(x)              -> (z_mu, z_logs)
@@ -82,6 +84,23 @@ def _mu_sig(z_mu, z_logs):
     m = torch.exp(torch.clamp(z_mu, -30.0, 30.0))
     sig = torch.exp(torch.clamp(z_logs, LOG_SIG_MIN, LOG_SIG_MAX))
     return m, sig
+
+
+def clamp_saturation(err_sp, std_factor, tol=0.01):
+    """Fraction of predicted sigmas pinned at the LOG_SIG_MIN/MAX rails.
+
+    err_sp is the 1-sigma std (sig * std_factor); divide it back to recover the
+    clamped sig and test proximity to the [exp(LOG_SIG_MIN), exp(LOG_SIG_MAX)]
+    bounds. A non-trivial fraction at a rail means the clamp -- not the data -- is
+    setting those errors, so sharpness/calibration there are partly measuring the
+    clamp; widen the bound or check why the head wants to run off it."""
+    sig = np.asarray(err_sp, float) / std_factor
+    sig = sig[np.isfinite(sig)]
+    lo, hi = math.exp(LOG_SIG_MIN), math.exp(LOG_SIG_MAX)
+    if sig.size == 0:
+        return 0.0, 0.0
+    return (float(np.mean(sig <= lo * (1 + tol))),
+            float(np.mean(sig >= hi * (1 - tol))))
 
 
 def het_nll(z_mu, z_logs, plx, err, beta=0.0):
@@ -383,6 +402,23 @@ def main():
         E.print_report(rep)
         E.print_overfit_gap(rep_in, rep)
         E.print_calibration(bins, c)
+
+        # ---- per-star error head: is it real, calibrated, or just clamped? ----
+        # (held-out cat; run sharpness FIRST -- rho~0 sinks the whole het motivation)
+        ca = (cat["plx_sp"], cat["plx_a"], cat["err_a"], cat["err_sp"])
+        rho = E.sharpness(*ca)
+        z = E.zscore(*ca)
+        z_width, z_tail = E.robust_scatter(z), float(np.mean(np.abs(z) > 3))
+        cov = E.coverage(*ca)
+        at_lo, at_hi = clamp_saturation(err_sp, std_factor)
+        print(f"  sharpness (rho: err_sp vs |resid|, hi-S/N) : {rho:+.3f}"
+              "   (~0 => het head decorative, a constant err would score as well)")
+        print(f"  z-score honesty: robust width {z_width:.2f} (1=honest),"
+              f" |z|>3 {100*z_tail:.2f}% (Gaussian 0.27% -> excess = tail)")
+        E.print_coverage(cov)
+        print(f"  sigma clamp saturation: {100*at_lo:.2f}% at floor (1e-4 mas),"
+              f" {100*at_hi:.2f}% at ceil (10 mas)"
+              "   (non-trivial => clamp doing model work)")
         print()
         for f in ("A", "B"):
             E.print_report(E.evaluate(cat, fold=f, label=label))
@@ -398,6 +434,12 @@ def main():
                 "median_spec_err_frac": rep["median_spec_err_frac"],
                 "overfit_gap_pp": gap["gap_pp"],
                 "recal_factor": c,
+                "sharpness_rho": rho,
+                "z_width": z_width,
+                "z_tail_gt3": z_tail,
+                "coverage_1sig": cov[0]["emp"],
+                "clamp_floor_frac": at_lo,
+                "clamp_ceil_frac": at_hi,
             }
             run.log(summary)
             run.summary.update(summary)
