@@ -41,6 +41,10 @@ SPECTRA="${SPECTRA:-${DATA}/spectra_infer_parallax_zpt.parquet}"
 ID_COL="${ID_COL:-sdss_id}"
 SNR_MIN="${SNR_MIN:-0}"           # optional snr floor; 0 = off (training-only cut)
 KEEP_FLAGGED="${KEEP_FLAGGED:-0}" # 1 = skip the spectrum_flags==0 cut
+# membership probability (Vasiliev & Baumgardt catalogues): set CATALOGUE_DIR to enable
+CATALOGUE_DIR="${CATALOGUE_DIR:-}"
+PROB_MIN="${PROB_MIN:-0.9}"
+GAIA_ID_COL="${GAIA_ID_COL:-gaia_dr3_source_id}"
 
 # output dir of per-cluster spectra parquets (== apply_nn.pbs CLUSTER_DIR)
 OUT_DIR="${OUT_DIR:-${SRC}/distance-estimator/clusters/spectra_per_cluster}"
@@ -64,7 +68,9 @@ echo "[pbs] spectra=${SPECTRA}"
 echo "[pbs] -> per-cluster spectra=${OUT_DIR}  run_apply=${RUN_APPLY}"
 
 flags=(--cluster-dir "${CLUSTER_DIR}" --spectra "${SPECTRA}"
-       --out-dir "${OUT_DIR}" --id-col "${ID_COL}" --snr-min "${SNR_MIN}")
+       --out-dir "${OUT_DIR}" --id-col "${ID_COL}" --snr-min "${SNR_MIN}"
+       --prob-min "${PROB_MIN}" --gaia-id-col "${GAIA_ID_COL}")
+[ -n "${CATALOGUE_DIR}" ] && flags+=(--catalogue-dir "${CATALOGUE_DIR}")
 [ "${KEEP_FLAGGED}" = "1" ] && flags+=(--keep-flagged)
 
 ${PYTHON_BIN} prepare_cluster_spectra.py "${flags[@]}"

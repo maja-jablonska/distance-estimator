@@ -83,13 +83,36 @@ SPEC_COLS_OPTIONAL = ["snr", "spectrum_flags", "zeropoint"]
 # ----------------------------------------------------------------------
 # stage 1 — read each cluster's member ids from the astra-matched parquet
 # ----------------------------------------------------------------------
-def load_cluster_members(cluster_dir, id_col="sdss_id", pattern="*_astra_matched.parquet",
-                         strip_suffix="_astra_matched"):
-    """{cluster_name: int64 member id array} from the matched-astra parquets.
+def _read_catalogue_probs(cat_path):
+    """{Gaia source_id: membership probability} from a Vasiliev & Baumgardt (2021)
+    globular-cluster catalogue .txt (see clusters/!readme.txt): column 0 is the
+    Gaia (E)DR3 source_id, the LAST column is the membership probability. The header
+    line is commented with '#'. Column 0 is forced to int64 so the 19-digit source
+    ids are not silently truncated through float."""
+    import pandas as pd
+    df = pd.read_csv(cat_path, sep=r"\s+", comment="#", header=None,
+                     dtype={0: "int64"}, low_memory=False)
+    sid = df.iloc[:, 0].to_numpy()
+    prob = df.iloc[:, -1].astype(float).to_numpy()
+    return dict(zip(sid.tolist(), prob.tolist()))
 
-    Reads ONLY the id column from each file. Cluster name is the file stem with
-    `strip_suffix` removed (so `NGC_3201_astra_matched.parquet` -> `NGC_3201`),
-    which becomes the output parquet name apply_nn.pbs labels members with.
+
+def load_cluster_members(cluster_dir, id_col="sdss_id", gaia_id_col="gaia_dr3_source_id",
+                         catalogue_dir=None, prob_min=0.0,
+                         pattern="*_astra_matched.parquet", strip_suffix="_astra_matched"):
+    """Return ({cluster_name: int64 member id array}, {member id: memberprob}).
+
+    Cluster name is the file stem with `strip_suffix` removed (so
+    `NGC_3201_astra_matched.parquet` -> `NGC_3201`), which becomes the output
+    parquet name apply_nn.pbs labels members with.
+
+    Membership probability: cluster.ipynb matched the catalogues on source_id with
+    NO probability cut, so the matched parquets still contain memberprob~0 field
+    stars. When `catalogue_dir` is given, each cluster's <name>.txt is re-joined by
+    `gaia_id_col` (gaia_dr3_source_id; the catalogues are Gaia EDR3 == DR3 keyed)
+    and only members with memberprob >= `prob_min` are kept. The probabilities are
+    returned too, so prepare() can carry a `memberprob` column through to the
+    inferred catalogs for inspection / probability weighting in the test.
     """
     import pyarrow.parquet as pq
 
@@ -100,7 +123,9 @@ def load_cluster_members(cluster_dir, id_col="sdss_id", pattern="*_astra_matched
     if not files:
         raise SystemExit(f"no parquet files found in {cluster_dir}")
 
-    members = {}
+    use_prob = catalogue_dir is not None
+    members, prob_lut = {}, {}
+    n_no_cat = 0
     for f in files:
         name = Path(f).stem
         if strip_suffix and name.endswith(strip_suffix):
@@ -111,12 +136,48 @@ def load_cluster_members(cluster_dir, id_col="sdss_id", pattern="*_astra_matched
                 f"{f} has no '{id_col}' column (available: {sorted(avail)[:12]}...). "
                 f"Pass --id-col with the join key shared by these parquets and the "
                 f"spectra parquet.")
-        ids = pq.read_table(f, columns=[id_col]).column(0).to_numpy()
-        ids = np.asarray(ids)
-        ids = ids[np.isfinite(ids)] if np.issubdtype(ids.dtype, np.floating) else ids
-        ids = np.unique(ids.astype(np.int64))
-        members[name] = ids
-        log(f"  {name:<24} {len(ids):>6} unique members")
+        read_cols = [id_col]
+        if use_prob:
+            if gaia_id_col not in avail:
+                raise SystemExit(
+                    f"{f} has no '{gaia_id_col}' column, needed to join membership "
+                    f"probability. Pass --gaia-id-col (available: {sorted(avail)[:12]}...).")
+            read_cols.append(gaia_id_col)
+        t = pq.read_table(f, columns=read_cols).to_pandas()
+        sdss = np.asarray(t[id_col].to_numpy())
+        sdss = sdss[np.isfinite(sdss)] if np.issubdtype(sdss.dtype, np.floating) else sdss
+        sdss = sdss.astype(np.int64)
+
+        if use_prob:
+            cat_path = os.path.join(catalogue_dir, f"{name}.txt")
+            gid = np.asarray(t[gaia_id_col].to_numpy())
+            if not os.path.exists(cat_path):
+                log(f"  WARNING {name}: catalogue {cat_path} not found "
+                    f"-> probability cut NOT applied for this cluster")
+                n_no_cat += 1
+                probs = np.full(len(sdss), np.nan)
+            else:
+                lut = _read_catalogue_probs(cat_path)
+                # gaia ids may be int64, nullable Int64, or float with NaN
+                def gkey(g):
+                    if g is None or (isinstance(g, float) and not np.isfinite(g)):
+                        return None
+                    return int(g)
+                probs = np.array([lut.get(gkey(g), np.nan) for g in gid], float)
+            keep = probs >= prob_min                      # NaN >= x is False -> dropped
+            n_before = len(sdss)
+            sdss, probs = sdss[keep], probs[keep]
+            for s, p in zip(sdss.tolist(), probs.tolist()):
+                prob_lut[int(s)] = float(p)
+            log(f"  {name:<24} {len(sdss):>6} / {n_before:<6} members "
+                f"(memberprob >= {prob_min:g})")
+        else:
+            log(f"  {name:<24} {len(np.unique(sdss)):>6} members (no probability cut)")
+
+        members[name] = np.unique(sdss)
+
+    if use_prob and n_no_cat:
+        log(f"NOTE: {n_no_cat} cluster(s) had no catalogue file -> kept unfiltered")
 
     # warn on members claimed by >1 cluster (rare for GCs; they'd be written twice)
     seen, dup = set(), set()
@@ -126,7 +187,7 @@ def load_cluster_members(cluster_dir, id_col="sdss_id", pattern="*_astra_matched
     if dup:
         log(f"NOTE: {len(dup)} member id(s) appear in >1 cluster -> written to each")
     log(f"loaded {len(members)} clusters, {len(seen)} unique member ids total")
-    return members
+    return members, prob_lut
 
 
 # ----------------------------------------------------------------------
@@ -185,6 +246,7 @@ def fetch_member_spectra(spectra_path, member_ids, id_col="sdss_id", batch_rows=
 # stage 3 — cuts + one-clean-spectrum-per-star + per-cluster write
 # ----------------------------------------------------------------------
 def prepare(cluster_dir, spectra_path, out_dir, *, id_col="sdss_id",
+            gaia_id_col="gaia_dr3_source_id", catalogue_dir=None, prob_min=0.0,
             require_clean=True, snr_min=0.0, batch_rows=20000):
     """End-to-end: members -> member spectra -> cuts/dedup -> per-cluster parquets."""
     import pandas as pd
@@ -193,7 +255,12 @@ def prepare(cluster_dir, spectra_path, out_dir, *, id_col="sdss_id",
     out_dir.mkdir(parents=True, exist_ok=True)
 
     log("stage 1: reading cluster member ids ...")
-    members = load_cluster_members(cluster_dir, id_col=id_col)
+    members, prob_lut = load_cluster_members(
+        cluster_dir, id_col=id_col, gaia_id_col=gaia_id_col,
+        catalogue_dir=catalogue_dir, prob_min=prob_min)
+    if not any(len(v) for v in members.values()):
+        raise SystemExit("no members survive the membership-probability cut "
+                         f"(prob_min={prob_min}); lower --prob-min or check --catalogue-dir")
     all_ids = np.unique(np.concatenate(list(members.values())))
 
     log(f"stage 2: streaming spectra parquet for {len(all_ids)} member ids ...")
@@ -227,6 +294,10 @@ def prepare(cluster_dir, spectra_path, out_dir, *, id_col="sdss_id",
     n_dup = n_rows - len(spec)
     if n_dup:
         log(f"collapsed {n_dup} extra visit/reduction rows -> one spectrum per star")
+    # carry membership probability through so the inferred catalogs keep it
+    if prob_lut:
+        spec["memberprob"] = [prob_lut.get(int(i), np.nan)
+                              for i in spec[id_col].to_numpy()]
     spec_by_id = {int(i): k for k, i in enumerate(spec[id_col].to_numpy())}
     log(f"{len(spec)} unique stars with a clean spectrum ready")
 
@@ -280,6 +351,15 @@ def main():
     ap.add_argument("--id-col", default="sdss_id",
                     help="join key shared by the cluster parquets and the spectra "
                          "parquet (default sdss_id)")
+    ap.add_argument("--catalogue-dir", default=None,
+                    help="dir of Vasiliev&Baumgardt <cluster>.txt catalogues; enables "
+                         "the membership-probability cut (memberprob = last column)")
+    ap.add_argument("--prob-min", type=float, default=0.9,
+                    help="membership probability threshold (default 0.9; only applied "
+                         "when --catalogue-dir is given)")
+    ap.add_argument("--gaia-id-col", default="gaia_dr3_source_id",
+                    help="gaia source-id column in the cluster parquets used to join "
+                         "the catalogue membership probability")
     ap.add_argument("--keep-flagged", action="store_true",
                     help="do NOT cut on spectrum_flags==0 (default keeps only clean)")
     ap.add_argument("--snr-min", type=float, default=0.0,
@@ -290,7 +370,9 @@ def main():
     args = ap.parse_args()
 
     prepare(args.cluster_dir, args.spectra, args.out_dir,
-            id_col=args.id_col, require_clean=not args.keep_flagged,
+            id_col=args.id_col, gaia_id_col=args.gaia_id_col,
+            catalogue_dir=args.catalogue_dir, prob_min=args.prob_min,
+            require_clean=not args.keep_flagged,
             snr_min=args.snr_min, batch_rows=args.batch_rows)
 
 

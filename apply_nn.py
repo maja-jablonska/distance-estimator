@@ -140,6 +140,13 @@ def apply_to_parquet(bundle, parquet, allstar, *, out=None, cluster_name=None,
         "r_med_photogeo_pc": merged["r_med_photogeo"].to_numpy(float)[keep],
         "spec_bad_frac": star_bad,
     }
+    # carry membership probability through (added by prepare_cluster_spectra) so the
+    # cluster test can threshold / probability-weight on it
+    import pyarrow.parquet as pq
+    if "memberprob" in set(pq.ParquetFile(parquet).schema_arrow.names):
+        mp = pq.read_table(parquet, columns=["memberprob"]).column(0).to_numpy()
+        cols["memberprob"] = np.asarray(mp, float)[keep]
+
     if cluster_col:
         cols["cluster"] = _resolve_cluster(parquet, allstar, cluster_col, ids_k)
     elif cluster_name:

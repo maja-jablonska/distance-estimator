@@ -63,6 +63,13 @@ def main():
     # prep options (forwarded to prepare_cluster_spectra)
     ap.add_argument("--id-col", default="sdss_id",
                     help="join key shared by cluster parquets and the spectra parquet")
+    ap.add_argument("--catalogue-dir", default=None,
+                    help="dir of Vasiliev&Baumgardt <cluster>.txt catalogues; enables "
+                         "the membership-probability cut")
+    ap.add_argument("--prob-min", type=float, default=0.9,
+                    help="membership probability threshold (default 0.9; needs --catalogue-dir)")
+    ap.add_argument("--gaia-id-col", default="gaia_dr3_source_id",
+                    help="gaia source-id column used to join catalogue membership probability")
     ap.add_argument("--keep-flagged", action="store_true",
                     help="skip the spectrum_flags==0 clean-spectrum cut")
     ap.add_argument("--snr-min", type=float, default=0.0,
@@ -96,8 +103,9 @@ def main():
     else:
         R.log("[1/3] preparing per-cluster spectra datasets ...")
         P.prepare(args.cluster_dir, args.spectra, spectra_dir, id_col=args.id_col,
-                  require_clean=not args.keep_flagged, snr_min=args.snr_min,
-                  batch_rows=args.batch_rows)
+                  gaia_id_col=args.gaia_id_col, catalogue_dir=args.catalogue_dir,
+                  prob_min=args.prob_min, require_clean=not args.keep_flagged,
+                  snr_min=args.snr_min, batch_rows=args.batch_rows)
 
     import pyarrow.parquet as pq
     cluster_files = sorted(glob.glob(str(spectra_dir / "*.parquet")))

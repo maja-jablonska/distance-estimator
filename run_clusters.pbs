@@ -37,6 +37,10 @@ WORK_DIR="${WORK_DIR:-/scratch/mk27/${USER}/cluster_run}"
 ID_COL="${ID_COL:-sdss_id}"
 SNR_MIN="${SNR_MIN:-0}"
 KEEP_FLAGGED="${KEEP_FLAGGED:-0}"
+# membership probability (Vasiliev & Baumgardt catalogues): set CATALOGUE_DIR to enable
+CATALOGUE_DIR="${CATALOGUE_DIR:-}"
+PROB_MIN="${PROB_MIN:-0.9}"
+GAIA_ID_COL="${GAIA_ID_COL:-gaia_dr3_source_id}"
 OFFSET="${OFFSET:-0.0}"           # set if spectra parquet lacks 'zeropoint'
 ERR_SCALE="${ERR_SCALE:-1.0}"
 PLX_G="${PLX_G:-plx}"
@@ -50,7 +54,9 @@ echo "[pbs] cluster meta=${CLUSTER_DIR} -> work=${WORK_DIR}"
 flags=(--cluster-dir "${CLUSTER_DIR}" --spectra "${SPECTRA}" --allstar "${ALLSTAR}"
        --model "${MODEL}" --pixel-mask-dir "${PIXEL_MASK_DIR}" --work-dir "${WORK_DIR}"
        --id-col "${ID_COL}" --snr-min "${SNR_MIN}"
+       --prob-min "${PROB_MIN}" --gaia-id-col "${GAIA_ID_COL}"
        --offset "${OFFSET}" --err-scale "${ERR_SCALE}" --plx-g "${PLX_G}")
+[ -n "${CATALOGUE_DIR}" ] && flags+=(--catalogue-dir "${CATALOGUE_DIR}")
 [ "${KEEP_FLAGGED}" = "1" ] && flags+=(--keep-flagged)
 
 ${PYTHON_BIN} run_clusters.py "${flags[@]}"
