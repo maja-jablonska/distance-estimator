@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spphot"
+version = "0.1.0"
+description = "Spectrophotometric parallaxes for APOGEE luminous giants (inner-Galaxy distances)"
+requires-python = ">=3.10"
+dependencies = ["numpy", "pandas", "pyarrow", "astropy"]
+
+[project.optional-dependencies]
+nn = ["torch"]
+v2 = ["jax"]
+plots = ["matplotlib"]
+
+# Nothing on Gadi requires installation: the PBS jobs run the root driver
+# scripts from the repo dir (`#PBS -l wd`), and Python puts the script's own
+# directory on sys.path, so `import spphot` resolves without install.
+# `pip install -e .` is a convenience for laptop/Jupyter kernels started
+# elsewhere; note it installs ONLY the spphot package — the root drivers and
+# the spphot_eval/spphot_plots/cluster_test shims stay repo-local.
+[tool.setuptools]
+packages = ["spphot"]

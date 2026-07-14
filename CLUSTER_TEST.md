@@ -59,7 +59,7 @@ python run_cluster_test.py cluster_nn/*_nn.parquet --err-scale 1.49
 ### In a notebook
 
 ```python
-import pandas as pd, cluster_test as C
+import pandas as pd, spphot.clusters as C   # `import cluster_test as C` still works (shim)
 df = pd.concat([pd.read_parquet(f) for f in glob.glob("cluster_nn/*_nn.parquet")],
                ignore_index=True)
 members = C.members_from_labels(df, "cluster")        # no crosswalk: label is in df

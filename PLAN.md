@@ -1,7 +1,8 @@
 # Spectrophotometric distances to luminous giants in the inner Galaxy — working plan
 
 This is the methods backbone of the paper, mapped onto what already exists in this
-repo. Two invariants inherited from Hogg+18: never cut/invert/log parallaxes (all
+repo (the per-item plan→code table with status lives in `CODE_MAP.md`; the code
+itself is organized as the `spphot/` package with thin root drivers). Two invariants inherited from Hogg+18: never cut/invert/log parallaxes (all
 distance information enters through likelihoods), and leave-out training so no
 star's anchor data touches its own prediction. Two new principles: extrapolation
 must degrade *linearly, not silently* outside the training hull (made mechanical by

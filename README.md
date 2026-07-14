@@ -1,39 +1,66 @@
-# Spectrophotometric Parallax — Baseline Eval Harness
+# spphot — spectrophotometric distances to APOGEE luminous giants
 
-Reproduces and scores Hogg, Eilers & Rix (2018) so a new model (e.g. a
-heteroscedastic neural net) is judged on identical footing.
+Distances to APOGEE luminous giants (0 < log g ≤ 2.2) valid into the bulge,
+following Hogg, Eilers & Rix (2018) and extending it for the inner Galaxy.
+Method docs: `OUTLINE.md` (full plan) → `PLAN.md` (repo-mapped staging) →
+`CODE_MAP.md` (plan → code, with status). Model-specific: `NN_MODEL.md`
+(het-NN + calibration), `CLUSTER_TEST.md` (cluster validation).
 
-## Files
-- `hogg2018.fits` — published Zenodo catalog (record 1468053), 44,784 stars.
-  Columns: 2MASS_ID, Gaia_parallax(_err), spec_parallax(_err), training_set, sample.
-- `spphot_eval.py`  — metrics (robust scatter, bias, chi2) + catalog loader.
-- `spphot_plots.py` — Fig 2, residual histogram, two-model comparison.
+## Layout
 
-## Baseline numbers (verified against the paper)
-- N training = 28,226 ; negative Gaia parallaxes = 4.9% (paper: ">2%")
-- hi-S/N (Gaia S/N>=20) probe: robust fractional scatter = 9.4%  (paper: <9%)
-- bias (median frac resid) = -2.7%
-- chi2 mean/median/robust = 2.96 / 0.89 / 1.94
-  -> mean >> median == OUTLIER-DRIVEN, exactly as the paper reports.
+```
+spphot/            the package: datasets (swap seam), data, linear, nn, v2,
+                   eval, plots, clusters   (see spphot/__init__.py)
+*.py               entry-point drivers the PBS jobs invoke by name
+                   (+ spphot_eval/spphot_plots/cluster_test re-export shims)
+*.pbs              Gadi batch jobs
+tests/             synthetic fixture + end-to-end smoke test
+notebooks/         analysis notebooks (first cell bootstraps sys.path)
+legacy/            superseded scripts (see legacy/README.md)
+```
 
-## How to score your NN
-Your model writes a FITS with the four parallax columns (copy Gaia cols
-through unchanged; fill spec_parallax/_err with predictions) on the fold it
-did NOT train on. Then:
+No installation needed on Gadi (jobs run from the repo dir); locally,
+`pip install -e .` puts `spphot` on any kernel's path.
 
-    import spphot_eval as E, spphot_plots as P
-    base = E.load_catalog("hogg2018.fits")
-    new  = E.load_catalog("my_nn_foldB.fits")
-    E.print_report(E.evaluate(new, fold="B", label="NN"))
-    P.compare_scatter(base, new, "compare.png")
+**After `git pull` on Gadi:** `find . -name __pycache__ -prune -exec rm -rf {} +`
+once — stale bytecode from the pre-package layout can shadow the new modules.
 
-## What "beating the baseline" means
-1. robust scatter < 9.4%  (tighter core)
-2. mean chi2 closer to 1   <- the real win: the aleatoric sigma_int head
-   should absorb the dusty/crowded outliers that inflate chi2 here.
-3. preserve A/B fold independence: score each fold only with the model
-   trained on the complementary fold (never leak).
+## Datasets
 
-## NOT reproducible from this catalog alone (need extra crossmatched data)
-Figs 3/4/5/6 need APOGEE stellar params, G-mag, sky coords, PMs, RVs.
-Pull those by 2MASS-ID crossmatch to the Gaia archive on Gadi.
+Photometry bands are defined in `spphot/datasets.py` (`REGISTRY`); every
+driver takes `--dataset` (default `dr17` = Gaia DR3 + 2MASS + WISE) and
+`--aux-phot <parquet>` for auxiliary photometry (the upcoming VVV/VIRAC2
+swap). Checkpoints record their dataset; apply-time feature assembly always
+matches training, including for pre-dataset checkpoints.
+
+## Smoke test
+
+```bash
+bash tests/smoke_test.sh        # <2 min on a laptop; PY=<python> to override
+```
+
+Runs the whole chain on a synthetic fixture and prints value digests — after
+any refactor, identical digests prove behavior is unchanged.
+
+## Baseline (Hogg+18 reproduction, verified)
+
+- Zenodo catalog (`hogg2018.fits`): hi-S/N robust scatter 9.4%, bias −2.7%,
+  χ² mean/median/robust 2.96 / 0.89 / 1.94 (outlier-driven, as the paper reports).
+- Our DR17+DR3 rerun (`run_full_gadi.py --clip-sigma 4`): **9.76% scatter,
+  −1.09% bias** — the stage-1 baseline every later stage must beat (PLAN.md).
+
+## Scoring a new model
+
+Score on the fold the model did NOT train on, in parallax space:
+
+```python
+import spphot.eval as E, spphot.plots as P
+base = E.load_catalog("hogg2018.fits")
+new  = E.load_catalog("my_model_foldB.fits")
+E.print_report(E.evaluate(new, fold="B", label="NN"))
+P.compare_scatter(base, new, "compare.png")
+```
+
+Beating the baseline means: robust scatter below it, χ² near 1 (honest
+errors — see the calibration machinery in `spphot.eval` and the Gaia-free
+`internal_chi2` in `CLUSTER_TEST.md`), and A/B independence preserved.
