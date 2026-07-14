@@ -82,6 +82,9 @@ def main():
     ap.add_argument("--head", type=int, default=None, metavar="X",
                     help="test mode: only cross-match the first X rows "
                          "of parquet_in")
+    ap.add_argument("--retries", type=int, default=3,
+                    help="attempts per chunk before skipping it (skipped "
+                         "chunks -> <out>.failed.parquet for a re-run)")
     ap.add_argument("--discover", action="store_true",
                     help="list VIRAC2 tables/columns in the TAP schema and exit")
     args = ap.parse_args()
@@ -135,15 +138,36 @@ def main():
           f"querying those only.")
     work = work[in_box].reset_index(drop=True)
 
-    results = []
+    # A failed chunk (TAP timeout, 5xx, dropped connection) is retried, then
+    # SKIPPED — its stars come out unmatched (NaN) instead of killing the run,
+    # and are written to <out>.failed.parquet for a targeted re-run.
+    results, failed = [], []
+    n_chunks = (len(work) + CHUNK - 1) // CHUNK
     for i in range(0, len(work), CHUNK):
         chunk = work.iloc[i:i + CHUNK]
-        t0 = time.time()
-        res = xmatch_chunk(tap, chunk, args.radius)
-        print(f"chunk {i // CHUNK + 1}: {len(chunk)} uploaded, "
-              f"{len(res)} matches, {time.time() - t0:.0f}s")
-        results.append(res)
+        tag = f"chunk {i // CHUNK + 1}/{n_chunks}"
+        for attempt in range(1, args.retries + 1):
+            t0 = time.time()
+            try:
+                res = xmatch_chunk(tap, chunk, args.radius)
+            except Exception as e:
+                wait = 30 * attempt
+                print(f"{tag}: attempt {attempt}/{args.retries} failed "
+                      f"({type(e).__name__}: {e}); retrying in {wait}s")
+                time.sleep(wait)
+                continue
+            print(f"{tag}: {len(chunk)} uploaded, {len(res)} matches, "
+                  f"{time.time() - t0:.0f}s")
+            results.append(res)
+            break
+        else:
+            print(f"{tag}: GIVING UP after {args.retries} attempts — "
+                  f"{len(chunk)} stars carried through unmatched")
+            failed.append(chunk)
 
+    if not results:
+        sys.exit("every chunk failed — is the TAP service down? "
+                 "Nothing written.")
     matched = pd.concat(results, ignore_index=True)
 
     # Resolve multiple matches: keep nearest, but KEEP a flag — a second
@@ -159,6 +183,18 @@ def main():
     out.to_parquet(args.parquet_out, index=False)
     n_match = out["sep_arcsec"].notna().sum()
     print(f"{n_match}/{len(df)} targets matched -> {args.parquet_out}")
+
+    if failed:
+        # sidecar with the ORIGINAL column names, so it feeds straight back in:
+        #   python vvv.py <out>.failed.parquet retry.parquet --id-col ... ;
+        # then combine:  out.fillna(retry)  or concat matched rows by id.
+        fdf = pd.concat(failed, ignore_index=True).rename(columns={
+            "_uid": args.id_col, "_ra": args.ra_col, "_dec": args.dec_col})
+        fpath = args.parquet_out + ".failed.parquet"
+        fdf.to_parquet(fpath, index=False)
+        print(f"WARNING: {len(fdf)} stars in {len(failed)} failed chunk(s) were "
+              f"never queried (unmatched in the output, NOT confirmed absent) "
+              f"-> re-run them from {fpath}")
 
 
 if __name__ == "__main__":
