@@ -57,7 +57,31 @@ def discover(tap):
         print(tap.run_sync(q2).to_table())
 
 
-def xmatch_chunk(tap, chunk_df, radius_arcsec):
+def virac_coord_cols(tap, table, ra_override=None, dec_override=None):
+    """The actual RA/Dec column names in the VIRAC2 table, from TAP_SCHEMA
+    (the names vary between ESO releases, and unquoted DEC can trip the ADQL
+    parser as a reserved word). Overrides win; else pick by common aliases."""
+    q = f"""SELECT column_name FROM TAP_SCHEMA.columns
+            WHERE table_name = '{table}'"""
+    cols = [str(c) for c in tap.run_sync(q).to_table()["column_name"]]
+    by_lower = {c.lower(): c for c in cols}
+
+    def pick(override, candidates, what):
+        if override:
+            return override
+        for cand in candidates:
+            if cand in by_lower:
+                return by_lower[cand]
+        sys.exit(f"could not identify the {what} column in {table} — pass "
+                 f"--virac-ra/--virac-dec. Columns: {sorted(cols)}")
+    ra = pick(ra_override, ["ra", "ra2000", "raj2000", "right_ascension", "alpha"], "RA")
+    dec = pick(dec_override, ["dec", "dec2000", "dej2000", "declination",
+                              "delta", "de"], "Dec")
+    print(f"VIRAC2 coordinate columns: {ra}, {dec}")
+    return ra, dec
+
+
+def xmatch_chunk(tap, chunk_df, radius_arcsec, vra, vdec):
     """Pull every VIRAC2 source within `radius_arcsec` of ANY target in the
     chunk (no upload — ESO tap_cat forbids TAP_UPLOAD), then assign each
     returned source to its nearest target locally and cut to the radius.
@@ -69,8 +93,9 @@ def xmatch_chunk(tap, chunk_df, radius_arcsec):
     import astropy.units as u
 
     r_deg = radius_arcsec / 3600.0
+    # double quotes = ADQL delimited identifiers (exact-case, reserved-word-safe)
     circles = " OR ".join(
-        f"1=CONTAINS(POINT('ICRS', v.ra, v.dec), "
+        f"1=CONTAINS(POINT('ICRS', v.\"{vra}\", v.\"{vdec}\"), "
         f"CIRCLE('ICRS', {ra:.8f}, {dec:.8f}, {r_deg:.8f}))"
         for ra, dec in zip(chunk_df["_ra"], chunk_df["_dec"]))
     adql = f"SELECT {VIRAC2_COLS} FROM {VIRAC2_TABLE} AS v WHERE {circles}"
@@ -79,7 +104,10 @@ def xmatch_chunk(tap, chunk_df, radius_arcsec):
         return res.assign(_uid=pd.Series(dtype=str),
                           sep_arcsec=pd.Series(dtype=float))
 
-    src = SkyCoord(res["ra"].values * u.deg, res["dec"].values * u.deg)
+    # result column case can differ from TAP_SCHEMA's — look up insensitively
+    rcols = {c.lower(): c for c in res.columns}
+    r_ra, r_dec = rcols[vra.lower()], rcols[vdec.lower()]
+    src = SkyCoord(res[r_ra].values * u.deg, res[r_dec].values * u.deg)
     tgt = SkyCoord(chunk_df["_ra"].values * u.deg, chunk_df["_dec"].values * u.deg)
     idx, sep, _ = src.match_to_catalog_sky(tgt)
     res["_uid"] = chunk_df["_uid"].values[idx]
@@ -105,6 +133,12 @@ def main():
     ap.add_argument("--table", default=None,
                     help="VIRAC2 table name in the TAP schema (overrides the "
                          "VIRAC2_TABLE constant; find it with --discover)")
+    ap.add_argument("--virac-ra", default=None,
+                    help="RA column name IN THE VIRAC2 TABLE (default: "
+                         "auto-detect from TAP_SCHEMA)")
+    ap.add_argument("--virac-dec", default=None,
+                    help="Dec column name IN THE VIRAC2 TABLE (default: "
+                         "auto-detect from TAP_SCHEMA)")
     ap.add_argument("--discover", action="store_true",
                     help="list VIRAC2 tables/columns in the TAP schema and exit")
     args = ap.parse_args()
@@ -124,6 +158,8 @@ def main():
                  "(run with --discover to find the name).")
     if not (args.parquet_in and args.parquet_out):
         sys.exit("Provide input and output parquet paths.")
+
+    vra, vdec = virac_coord_cols(tap, VIRAC2_TABLE, args.virac_ra, args.virac_dec)
 
     # Read ONLY the three columns the crossmatch needs — the bulge parquets
     # carry spectra list-columns that decompress to tens of GB, and a full
@@ -173,7 +209,7 @@ def main():
         for attempt in range(1, args.retries + 1):
             t0 = time.time()
             try:
-                res = xmatch_chunk(tap, chunk, args.radius)
+                res = xmatch_chunk(tap, chunk, args.radius, vra, vdec)
             except Exception as e:
                 wait = 30 * attempt
                 print(f"{tag}: attempt {attempt}/{args.retries} failed "
