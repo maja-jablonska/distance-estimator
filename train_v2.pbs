@@ -1,0 +1,90 @@
+#!/bin/bash
+#PBS -N spphot_v2
+#PBS -P mk27
+#PBS -q rsaa
+#PBS -l ncpus=104
+#PBS -l mem=190GB
+#PBS -l walltime=10:00:00
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
+#PBS -l wd
+#PBS -j oe
+#PBS -m abe
+#PBS -M maja.jablonska@anu.edu.au
+
+# --------------------------------------------------------------------------
+# Linear-anchored gated-residual spectrophotometric parallax — train_v2.py
+# (PLAN.md model: linear backbone + bilinear extinction + mixture likelihood
+#  + anchors + hull-gated residual NN, staged unfreezing).
+#
+# Same prepare_sample as the linear baseline and train_nn — identical
+# features/zero-point/masks/splits, scored by the same spphot_eval.
+#
+# Submit:
+#   qsub train_v2.pbs                                    # full 3-stage model
+#   qsub -v STAGES=1 train_v2.pbs                        # linear backbone only
+#   qsub -v STAGES=2 train_v2.pbs                        # + mixture/pi0/scatter/phi
+#   qsub -v ANCHORS=/scratch/mk27/$USER/anchors.parquet train_v2.pbs
+#   qsub -v INIT_LINEAR=/scratch/mk27/$USER/spphot_model.npz train_v2.pbs
+# --------------------------------------------------------------------------
+
+set -euo pipefail
+
+export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}"
+
+SRC="${SRC:-/scratch/mk27/mj8805}"
+DATA="${DATA:-${SRC}/bulge-ages-and-orbits/data}"
+PARQUET="${PARQUET:-${DATA}/spectra_infer_parallax_zpt.parquet}"
+ALLSTAR="${ALLSTAR:-${DATA}/astraAllStarASPCAP-0.8.0.fits}"
+OUT="${OUT:-/scratch/mk27/${USER}/spphot_v2_results.parquet}"
+PIXEL_MASK_DIR="${PIXEL_MASK_DIR:-${SRC}/pixel_mask}"
+BATCH_ROWS="${BATCH_ROWS:-20000}"
+
+# staging / model knobs (override with -v)
+STAGES="${STAGES:-3}"
+PCA_K="${PCA_K:-128}"
+BETA="${BETA:-0.5}"
+SIG_BAD="${SIG_BAD:-1.0}"
+GATE_TAU="${GATE_TAU:-2.0}"
+BATCH_SIZE="${BATCH_SIZE:-4096}"
+LR="${LR:-1e-3}"
+DEVICE="${DEVICE:-auto}"
+ANCHORS="${ANCHORS:-}"
+INIT_LINEAR="${INIT_LINEAR:-}"
+
+USE_WANDB="${USE_WANDB:-1}"
+export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_DIR="${WANDB_DIR:-/scratch/mk27/${USER}/wandb}"
+WANDB_PROJECT="${WANDB_PROJECT:-spphot-v2}"
+RUN_NAME="${RUN_NAME:-v2-s${STAGES}-${PBS_JOBID:-local}}"
+mkdir -p "${WANDB_DIR}"
+
+export OMP_NUM_THREADS="${PBS_NCPUS:-48}"
+export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
+
+mkdir -p "$(dirname "${OUT}")"
+echo "[pbs] host=$(hostname) ncpus=${PBS_NCPUS:-?} parquet=${PARQUET}"
+echo "[pbs] out=${OUT} stages=${STAGES} pca_k=${PCA_K} beta=${BETA} anchors='${ANCHORS}' init_linear='${INIT_LINEAR}'"
+
+EXTRA_ARGS=()
+[ "${USE_WANDB}" = "1" ] && EXTRA_ARGS+=(--wandb --wandb-project "${WANDB_PROJECT}" --run-name "${RUN_NAME}")
+[ -n "${ANCHORS}" ] && EXTRA_ARGS+=(--anchors "${ANCHORS}")
+[ -n "${INIT_LINEAR}" ] && EXTRA_ARGS+=(--init-linear "${INIT_LINEAR}")
+
+${PYTHON_BIN} train_v2.py \
+    --parquet "${PARQUET}" \
+    --allstar "${ALLSTAR}" \
+    --out     "${OUT}" \
+    --pixel-mask-dir "${PIXEL_MASK_DIR}" \
+    --batch-rows "${BATCH_ROWS}" \
+    --stages "${STAGES}" \
+    --pca-k "${PCA_K}" \
+    --beta "${BETA}" \
+    --sig-bad "${SIG_BAD}" \
+    --gate-tau "${GATE_TAU}" \
+    --batch-size "${BATCH_SIZE}" \
+    --lr "${LR}" \
+    --device "${DEVICE}" \
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+
+echo "[pbs] done -> ${OUT}"
+echo "[pbs] sync wandb from copyq:  qsub -v WANDB_DIR=${WANDB_DIR} sync_wandb.pbs"
