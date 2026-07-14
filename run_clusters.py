@@ -8,10 +8,10 @@ This chains the three existing pieces in a single process:
   1. prepare_cluster_spectra.prepare  — cluster.ipynb's matched-astra metadata
        parquets + the big spectra parquet -> one clean spectra parquet per cluster
        (data-quality cuts: spectrum_flags==0, one best-snr spectrum per star).
-  2. apply_nn.load_bundle / apply_to_parquet — load the checkpoint + pixel masks
+  2. spphot.nn.load_bundle / apply_to_parquet — load the checkpoint + pixel masks
        ONCE, then infer plx_sp/err_sp for every cluster (features built on the
        saved good-pixel mask, identical to training).
-  3. cluster_test.run_cluster_test — IVW spec-vs-Gaia mean, member tightness, and
+  3. spphot.clusters.run_cluster_test — IVW spec-vs-Gaia mean, member tightness, and
        the Gaia-free internal-chi2 calibration check, on the concatenation.
 
 Loading the checkpoint once (vs the per-file python invocation in apply_nn.pbs)
@@ -39,10 +39,10 @@ import argparse
 import glob
 from pathlib import Path
 
-import run_full_gadi as R          # log()
+from spphot.data import log
+from spphot.nn import load_bundle, apply_to_parquet
+import spphot.clusters as C
 import prepare_cluster_spectra as P
-import apply_nn as A
-import cluster_test as C
 
 
 def main():
@@ -99,9 +99,9 @@ def main():
 
     # 1) prepare per-cluster spectra (cuts + one clean spectrum per star) ----------
     if args.skip_prep:
-        R.log(f"[1/3] skip-prep: reusing {spectra_dir}")
+        log(f"[1/3] skip-prep: reusing {spectra_dir}")
     else:
-        R.log("[1/3] preparing per-cluster spectra datasets ...")
+        log("[1/3] preparing per-cluster spectra datasets ...")
         P.prepare(args.cluster_dir, args.spectra, spectra_dir, id_col=args.id_col,
                   gaia_id_col=args.gaia_id_col, catalogue_dir=args.catalogue_dir,
                   prob_min=args.prob_min, require_clean=not args.keep_flagged,
@@ -114,21 +114,21 @@ def main():
     nonempty = [f for f in cluster_files if pq.ParquetFile(f).metadata.num_rows > 0]
     for f in cluster_files:
         if f not in nonempty:
-            R.log(f"skipping {Path(f).stem}: 0 spectra")
+            log(f"skipping {Path(f).stem}: 0 spectra")
     cluster_files = nonempty
     if not cluster_files:
         raise SystemExit(f"no non-empty prepared spectra parquets in {spectra_dir}")
 
     # 2) load the checkpoint ONCE, infer every cluster -----------------------------
     if args.skip_apply:
-        R.log(f"[2/3] skip-apply: reusing {nn_dir}")
+        log(f"[2/3] skip-apply: reusing {nn_dir}")
     else:
-        R.log(f"[2/3] applying {Path(args.model).name} to {len(cluster_files)} clusters ...")
-        bundle = A.load_bundle(args.model, args.pixel_mask_dir, args.device)
+        log(f"[2/3] applying {Path(args.model).name} to {len(cluster_files)} clusters ...")
+        bundle = load_bundle(args.model, args.pixel_mask_dir, args.device)
         for f in cluster_files:
             name = Path(f).stem
-            R.log(f"--- {name} ---")
-            A.apply_to_parquet(bundle, f, args.allstar,
+            log(f"--- {name} ---")
+            apply_to_parquet(bundle, f, args.allstar,
                                out=str(nn_dir / f"{name}_nn.parquet"),
                                cluster_name=name, f_max=2.0, batch_rows=args.batch_rows)
 
@@ -137,14 +137,14 @@ def main():
         raise SystemExit(f"no inferred catalogs in {nn_dir}")
 
     # 3) cluster test on the concatenation -----------------------------------------
-    R.log(f"[3/3] cluster test on {len(nn_files)} catalogs ...")
+    log(f"[3/3] cluster test on {len(nn_files)} catalogs ...")
     df = pd.concat([pd.read_parquet(f) for f in nn_files], ignore_index=True)
-    R.log(f"loaded {len(df)} stars from {len(nn_files)} cluster catalogs")
+    log(f"loaded {len(df)} stars from {len(nn_files)} cluster catalogs")
     members = C.members_from_labels(df, "cluster")
     rep = C.run_cluster_test(df, members, offset=args.offset, err_scale=args.err_scale,
                              plx_g=args.plx_g, min_members=args.min_members)
     C.print_cluster_test(rep)
-    R.log(f"done. prepared spectra -> {spectra_dir}; inferred catalogs -> {nn_dir}")
+    log(f"done. prepared spectra -> {spectra_dir}; inferred catalogs -> {nn_dir}")
 
 
 if __name__ == "__main__":

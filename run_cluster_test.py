@@ -10,7 +10,7 @@ group by the cluster label, and print the Hogg+18 Fig-4 cluster test.
 from __future__ import annotations
 import argparse, glob
 import pandas as pd
-import cluster_test as C
+import spphot.clusters as C
 
 
 def main():

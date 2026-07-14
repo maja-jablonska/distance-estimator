@@ -1,34 +1,11 @@
 #!/usr/bin/env python3
 """
-train_nn.py — heteroscedastic neural-net spectrophotometric parallax.
+train_nn.py — heteroscedastic neural-net spectrophotometric parallax (driver).
 
-Same sample, features, zero-point, pixel masks and A/B split as run_full_gadi.py
-(it reuses run_full_gadi.prepare_sample), but instead of the linear exp(X@theta)
-fit it trains an MLP that outputs BOTH a parallax AND a per-star error. A learned,
-per-star sigma is exactly what the linear baseline lacks: with a single constant
-fractional error the eval shows mean chi2 ~ 2.6 (outlier-driven). A heteroscedastic
-Gaussian head + scalar recal makes the ROBUST chi2 ~ 1 and usually tightens the
-scatter, but leaves mean chi2 >> 1 -- that outlier tail is only shrunk by the
-Student-t head (studentt_nll). Credit each claim to the right mechanism.
-
-Model (features x = standardized [photometry | ln-flux on the good pixels]):
-    body  = MLP(x)              -> (z_mu, z_logs)
-    plx_sp = exp(z_mu)          positive spec parallax (log-space, like the linear model)
-    sig_sp = exp(z_logs)        positive per-star spec-parallax error
-Likelihood (parallax space, never inverted; negative Gaia parallaxes kept):
-    plx_gaia ~ Normal(plx_sp, sig_sp^2 + e_plx^2)
-    NLL = 0.5 * [ (plx - plx_sp)^2 / (sig_sp^2 + e_plx^2) + log(sig_sp^2 + e_plx^2) ]
-The Gaia measurement error e_plx is folded into the variance, so sig_sp learns the
-*intrinsic* spec-parallax scatter.
-
-Cross-validation mirrors run_full_gadi exactly: a fold-A model, a fold-B model, and
-an all-train model; each training star is predicted by the model that did NOT see its
-fold, all others by the all-train model. The results parquet uses the same schema, so
-spphot_eval scores it apples-to-apples against the linear baseline.
-
-The eval report now also prints an OVERFIT GAP (robust scatter from in-fold vs
-held-out predictions): the MLP can overfit where the linear model can't, so a
-large gap says trust only the held-out number and regularize harder.
+Thin CLI over the spphot package: spphot.data.prepare_sample builds the same
+sample/features/zero-point/pixel-masks/A-B split as the linear baseline, and
+spphot.nn holds the model, losses, training loop and checkpoint I/O. See
+NN_MODEL.md for the method, results and how to read the eval report.
 
 Usage (see train_nn.pbs):
   python train_nn.py --parquet <spectra_zpt.parquet> --allstar <allStar.fits> \
@@ -40,183 +17,16 @@ Usage (see train_nn.pbs):
   #   -> nn_gauss-beta0.2.parquet, ... ; compare bias vs robust chi2 across them
 """
 from __future__ import annotations
-import os, sys, math, time, argparse
+import os, math, argparse
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-
-import run_full_gadi as R   # prepare_sample, log, LABEL_COLS
-from run_full_gadi import log
+from spphot.data import LABEL_COLS, log, prepare_sample                     # noqa: F401
+from spphot.nn import (LOG_SIG_MIN, LOG_SIG_MAX, HetMLP, het_nll,           # noqa: F401
+                       studentt_nll, clamp_saturation, standardize_fit,
+                       train_fold, predict_nn, save_nn_checkpoint)
+import spphot.eval as E
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# sig_sp is clamped to this range (mas) for numerical safety in exp/log
-LOG_SIG_MIN, LOG_SIG_MAX = math.log(1e-4), math.log(10.0)
-
-
-# ----------------------------------------------------------------------
-# model
-# ----------------------------------------------------------------------
-class HetMLP(nn.Module):
-    """MLP with two linear heads: log-parallax mean and log spec-error."""
-
-    def __init__(self, d_in, hidden=(1024, 512, 256), dropout=0.1):
-        super().__init__()
-        layers = []
-        d = d_in
-        for h in hidden:
-            layers += [nn.Linear(d, h), nn.SiLU(), nn.Dropout(dropout)]
-            d = h
-        self.body = nn.Sequential(*layers)
-        self.head_mu = nn.Linear(d, 1)      # z_mu   -> plx_sp = exp(z_mu)
-        self.head_logs = nn.Linear(d, 1)    # z_logs -> sig_sp = exp(z_logs)
-
-    def forward(self, x):
-        z = self.body(x)
-        return self.head_mu(z).squeeze(-1), self.head_logs(z).squeeze(-1)
-
-
-def _mu_sig(z_mu, z_logs):
-    """Map raw heads to (plx_sp, sig_sp) with the safety clamps."""
-    m = torch.exp(torch.clamp(z_mu, -30.0, 30.0))
-    sig = torch.exp(torch.clamp(z_logs, LOG_SIG_MIN, LOG_SIG_MAX))
-    return m, sig
-
-
-def clamp_saturation(err_sp, std_factor, tol=0.01):
-    """Fraction of predicted sigmas pinned at the LOG_SIG_MIN/MAX rails.
-
-    err_sp is the 1-sigma std (sig * std_factor); divide it back to recover the
-    clamped sig and test proximity to the [exp(LOG_SIG_MIN), exp(LOG_SIG_MAX)]
-    bounds. A non-trivial fraction at a rail means the clamp -- not the data -- is
-    setting those errors, so sharpness/calibration there are partly measuring the
-    clamp; widen the bound or check why the head wants to run off it."""
-    sig = np.asarray(err_sp, float) / std_factor
-    sig = sig[np.isfinite(sig)]
-    lo, hi = math.exp(LOG_SIG_MIN), math.exp(LOG_SIG_MAX)
-    if sig.size == 0:
-        return 0.0, 0.0
-    return (float(np.mean(sig <= lo * (1 + tol))),
-            float(np.mean(sig >= hi * (1 - tol))))
-
-
-def het_nll(z_mu, z_logs, plx, err, beta=0.0):
-    """Gaussian-in-parallax NLL with the Gaia error folded into the variance.
-
-    beta>0 gives the beta-NLL of Seitzer et al. 2022: each star's loss is weighted by
-    detach(var)**beta. Plain NLL (beta=0) down-weights high-variance stars and so
-    UNDERFITS the mean there (-> biased, unstable variance head); beta=0.5 restores
-    the mean's gradient in those regions (beta=1 ~ MSE) and removes most of that bias
-    while keeping the calibration."""
-    m, sig = _mu_sig(z_mu, z_logs)
-    var = sig * sig + err * err
-    nll = 0.5 * ((plx - m) ** 2 / var + torch.log(var))
-    if beta > 0:
-        nll = nll * var.detach() ** beta
-    return nll.mean()
-
-
-def studentt_nll(z_mu, z_logs, plx, err, nu):
-    """Heteroscedastic Student-t NLL: same per-star (plx_sp, sig_sp) heads, but the
-    residual is modelled as Student-t with squared scale sig_sp^2 + e_plx^2 and nu
-    degrees of freedom. The fat tails downweight outliers during training (a binary
-    contributes ~log of its residual instead of its square), so the fit and the
-    per-star scale are not dragged by the tail. sig_sp here is the t SCALE; its
-    standard deviation is sig_sp * sqrt(nu/(nu-2)) (applied at output time)."""
-    m, sig = _mu_sig(z_mu, z_logs)
-    s2 = sig * sig + err * err
-    r2 = (plx - m) ** 2 / s2
-    c = math.lgamma(nu / 2.0) - math.lgamma((nu + 1.0) / 2.0) + 0.5 * math.log(nu * math.pi)
-    return (c + 0.5 * torch.log(s2) + 0.5 * (nu + 1.0) * torch.log1p(r2 / nu)).mean()
-
-
-# ----------------------------------------------------------------------
-# standardize [phot | spec] with train-fold statistics
-# ----------------------------------------------------------------------
-def standardize_fit(A):
-    mu = A.mean(0)
-    sd = A.std(0)
-    sd[sd < 1e-8] = 1.0
-    return mu.astype(np.float32), sd.astype(np.float32)
-
-
-# ----------------------------------------------------------------------
-# train / predict
-# ----------------------------------------------------------------------
-def train_fold(feats, train_mask, plx, err, mu, sd, *, loss_fn, hidden, dropout, lr,
-               weight_decay, epochs, batch_size, device, seed, label, log_cb=None):
-    """Train a HetMLP on the stars in train_mask. Features are standardized per batch
-    with the supplied (mu, sd) — the train-fold stats — so nothing leaks from the
-    held-out fold."""
-    torch.manual_seed(seed)
-    idx_all = np.where(train_mask)[0]
-    n = idx_all.size
-    d_in = feats.shape[1]
-
-    model = HetMLP(d_in, hidden, dropout).to(device)
-    with torch.no_grad():                                  # sensible head biases
-        ptr = plx[idx_all]
-        med = float(np.median(ptr[ptr > 0])) if np.any(ptr > 0) else 1.0
-        model.head_mu.bias.fill_(math.log(max(med, 1e-3)))
-        model.head_logs.bias.fill_(math.log(0.1))          # ~0.1 mas initial spec error
-
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-
-    mu_t = torch.from_numpy(mu).to(device)
-    sd_t = torch.from_numpy(sd).to(device)
-    feats_t = torch.from_numpy(feats)                      # CPU; batches move to device
-    plx_t = torch.from_numpy(plx.astype(np.float32))
-    err_t = torch.from_numpy(err.astype(np.float32))
-    idx_t = torch.from_numpy(idx_all)
-
-    g = torch.Generator().manual_seed(seed)
-    t0 = time.time()
-    for ep in range(epochs):
-        model.train()
-        perm = idx_t[torch.randperm(n, generator=g)]
-        running = 0.0
-        for i in range(0, n, batch_size):
-            bidx = perm[i:i + batch_size]
-            xb = ((feats_t[bidx].to(device) - mu_t) / sd_t)
-            yb = plx_t[bidx].to(device)
-            eb = err_t[bidx].to(device)
-            z_mu, z_logs = model(xb)
-            loss = loss_fn(z_mu, z_logs, yb, eb)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-            running += loss.item() * bidx.numel()
-        sched.step()
-        if log_cb is not None:
-            log_cb(label, ep + 1, running / n, sched.get_last_lr()[0])
-        if ep == 0 or (ep + 1) % 10 == 0 or ep == epochs - 1:
-            log(f"    [{label}] epoch {ep+1}/{epochs}  NLL={running/n:.4f}  "
-                f"lr={sched.get_last_lr()[0]:.2e}  ({time.time()-t0:.0f}s)")
-    return model
-
-
-def predict_nn(model, feats, idx, mu, sd, device, batch=65536):
-    """Return (plx_sp, sig_sp) for feats[idx], standardized with (mu, sd)."""
-    model.eval()
-    mu_t = torch.from_numpy(mu).to(device)
-    sd_t = torch.from_numpy(sd).to(device)
-    feats_t = torch.from_numpy(feats)
-    idx = np.asarray(idx)
-    out_m = np.empty(idx.size, np.float64)
-    out_s = np.empty(idx.size, np.float64)
-    with torch.no_grad():
-        for i in range(0, idx.size, batch):
-            bidx = torch.from_numpy(idx[i:i + batch])
-            xb = (feats_t[bidx].to(device) - mu_t) / sd_t
-            z_mu, z_logs = model(xb)
-            m, sig = _mu_sig(z_mu, z_logs)
-            out_m[i:i + batch] = m.cpu().numpy()
-            out_s[i:i + batch] = sig.cpu().numpy()
-    return out_m, out_s
 
 
 # ----------------------------------------------------------------------
@@ -283,7 +93,6 @@ def main():
                     help="wandb run name / sweep group; each config appends its tag")
     args = ap.parse_args()
     import pandas as pd
-    import spphot_eval as E
 
     device = args.device
     if device == "auto":
@@ -295,9 +104,9 @@ def main():
 
     # ---- identical sample/features/splits as the linear pipeline. Built ONCE and
     #      reused across every sweep config (this is the expensive step). ----
-    S = R.prepare_sample(args.parquet, args.allstar, snr_min=args.snr_min,
-                         bad_frac=args.bad_frac, batch_rows=args.batch_rows,
-                         pixel_mask_dir=args.pixel_mask_dir, seed=args.seed)
+    S = prepare_sample(args.parquet, args.allstar, snr_min=args.snr_min,
+                       bad_frac=args.bad_frac, batch_rows=args.batch_rows,
+                       pixel_mask_dir=args.pixel_mask_dir, seed=args.seed)
     spec = S["spec"]
     # features = [photometry | ln-flux]; float32 for the net (frees the separate spec)
     feats = np.hstack([S["phot"].astype(np.float32), spec]).astype(np.float32, copy=False)
@@ -375,15 +184,11 @@ def main():
             "spec_bad_frac": S["star_bad"],
         }).to_parquet(out_path, index=False)
 
-        torch.save({
-            "state_dict": model_all.state_dict(),
-            "mu": muAll, "sd": sdAll,
-            "good_pixel_mask": S["good"],
-            "hidden": list(hidden), "dropout": args.dropout,
-            "label_cols": list(R.LABEL_COLS), "d_in": int(feats.shape[1]),
-            "snr_min": args.snr_min, "bad_frac": args.bad_frac, "seed": args.seed,
-            "std_factor": std_factor, **meta,
-        }, model_out)
+        save_nn_checkpoint(model_out, model_all, muAll, sdAll, S["good"],
+                           hidden=hidden, dropout=args.dropout,
+                           label_cols=LABEL_COLS, snr_min=args.snr_min,
+                           bad_frac=args.bad_frac, seed=args.seed,
+                           std_factor=std_factor, **meta)
         log(f"wrote {out_path}  ({len(plx_k)} stars); saved model -> {model_out}")
 
         # ---- eval (same metrics as the linear baseline) + calibration + overfit gap ----
