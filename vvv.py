@@ -28,11 +28,13 @@ import time
 import numpy as np
 import pandas as pd
 import pyvo
-from astropy.table import Table
 
 TAP_URL = "https://archive.eso.org/tap_cat"
 VIRAC2_TABLE = None  # set after running --discover, e.g. "VVVX.VIRAC2_sources"
-CHUNK = 20_000       # rows per upload; reduce if the service complains
+# ESO tap_cat has TAP_UPLOAD *disabled*, so the crossmatch is an OR-of-circles
+# WHERE clause (one CONTAINS per target) instead of an upload-join. Each circle
+# adds ~110 chars of ADQL, so keep chunks small enough for the query to parse.
+CHUNK = 500
 
 # Columns to pull from VIRAC2. Trim/extend after --discover shows the schema.
 # Keep the quality/crowding bookkeeping — you want it as covariates later.
@@ -56,18 +58,33 @@ def discover(tap):
 
 
 def xmatch_chunk(tap, chunk_df, radius_arcsec):
-    upload = Table.from_pandas(chunk_df[["_uid", "_ra", "_dec"]])
-    adql = f"""
-        SELECT a._uid, {VIRAC2_COLS},
-               DISTANCE(POINT('ICRS', a._ra, a._dec),
-                        POINT('ICRS', v.ra, v.dec)) * 3600.0 AS sep_arcsec
-        FROM TAP_UPLOAD.targets AS a
-        JOIN {VIRAC2_TABLE} AS v
-          ON 1 = CONTAINS(POINT('ICRS', v.ra, v.dec),
-                          CIRCLE('ICRS', a._ra, a._dec, {radius_arcsec}/3600.0))
-    """
-    job = tap.run_async(adql, uploads={"targets": upload})
-    return job.to_table().to_pandas()
+    """Pull every VIRAC2 source within `radius_arcsec` of ANY target in the
+    chunk (no upload — ESO tap_cat forbids TAP_UPLOAD), then assign each
+    returned source to its nearest target locally and cut to the radius.
+
+    A source sitting within the radius of two different targets is assigned
+    only to the nearer one — impossible in practice at r ~ 0.3" unless two
+    targets are themselves closer than the match radius."""
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+
+    r_deg = radius_arcsec / 3600.0
+    circles = " OR ".join(
+        f"1=CONTAINS(POINT('ICRS', v.ra, v.dec), "
+        f"CIRCLE('ICRS', {ra:.8f}, {dec:.8f}, {r_deg:.8f}))"
+        for ra, dec in zip(chunk_df["_ra"], chunk_df["_dec"]))
+    adql = f"SELECT {VIRAC2_COLS} FROM {VIRAC2_TABLE} AS v WHERE {circles}"
+    res = tap.run_sync(adql).to_table().to_pandas()
+    if res.empty:
+        return res.assign(_uid=pd.Series(dtype=str),
+                          sep_arcsec=pd.Series(dtype=float))
+
+    src = SkyCoord(res["ra"].values * u.deg, res["dec"].values * u.deg)
+    tgt = SkyCoord(chunk_df["_ra"].values * u.deg, chunk_df["_dec"].values * u.deg)
+    idx, sep, _ = src.match_to_catalog_sky(tgt)
+    res["_uid"] = chunk_df["_uid"].values[idx]
+    res["sep_arcsec"] = sep.arcsec
+    return res[res["sep_arcsec"] <= radius_arcsec]
 
 
 def main():
@@ -85,9 +102,16 @@ def main():
     ap.add_argument("--retries", type=int, default=3,
                     help="attempts per chunk before skipping it (skipped "
                          "chunks -> <out>.failed.parquet for a re-run)")
+    ap.add_argument("--table", default=None,
+                    help="VIRAC2 table name in the TAP schema (overrides the "
+                         "VIRAC2_TABLE constant; find it with --discover)")
     ap.add_argument("--discover", action="store_true",
                     help="list VIRAC2 tables/columns in the TAP schema and exit")
     args = ap.parse_args()
+
+    global VIRAC2_TABLE
+    if args.table:
+        VIRAC2_TABLE = args.table
 
     tap = pyvo.dal.TAPService(TAP_URL)
 
@@ -179,7 +203,7 @@ def main():
     # slim aux-phot table: one row per input target, VIRAC2 cols NaN where unmatched
     df[args.id_col] = df[args.id_col].astype(str)
     out = df.merge(matched.rename(columns={"_uid": args.id_col}),
-                   on=args.id_col, how="left")
+                   on=args.id_col, how="left", suffixes=("", "_virac"))
     out.to_parquet(args.parquet_out, index=False)
     n_match = out["sep_arcsec"].notna().sum()
     print(f"{n_match}/{len(df)} targets matched -> {args.parquet_out}")
