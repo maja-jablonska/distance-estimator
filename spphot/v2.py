@@ -26,24 +26,29 @@ import math, time, zlib
 from functools import partial
 import numpy as np
 
-from spphot.data import LABEL_COLS, log
+from spphot.data import log
+from spphot.datasets import FeatureLayout                    # noqa: F401 (re-export)
 from spphot.linear import load_model
 
 import jax
 import jax.numpy as jnp
 
-N_PHOT = len(LABEL_COLS)            # 8: g,bp,rp,j,h,k,w1,w2
-I_H, I_W2 = LABEL_COLS.index("h_mag"), LABEL_COLS.index("w2_mag")
 LOG_SIG_MIN, LOG_SIG_MAX = math.log(1e-4), math.log(10.0)
 LN10 = math.log(10.0)
 tree_map = jax.tree_util.tree_map
 
+# The feature-matrix layout [phot(n_phot) | A_rjce? | spec] is threaded through
+# every function as a FeatureLayout (spphot.datasets) instead of the former
+# module-level N_PHOT/I_H/I_W2 constants, so the band set is swappable.
 
-def rjce_aks(phot):
-    """RJCE extinction proxy A_Ks = 0.918 (H − W2 − 0.08) (Majewski+2011).
+
+def rjce_aks(phot, rjce_idx):
+    """RJCE extinction proxy A_Ks = 0.918 (H − W2 − 0.08) (Majewski+2011);
+    rjce_idx = DatasetSpec.rjce_indices(), the (H, W2) positions in the phot block.
     Kept raw (can scatter below 0 at low extinction — that is measurement noise,
     not a bug; clipping would bias the low-A end the injection test certifies)."""
-    return 0.918 * (phot[:, I_H] - phot[:, I_W2] - 0.08)
+    i_h, i_w2 = rjce_idx
+    return 0.918 * (phot[:, i_h] - phot[:, i_w2] - 0.08)
 
 
 # ----------------------------------------------------------------------
@@ -98,13 +103,13 @@ def mlp_apply(layers, x, key, dropout):
     return (x @ l["W"] + l["b"]).squeeze(-1)
 
 
-def init_params(key, d_in, pca_k, g_hidden, s_hidden, b_init):
+def init_params(key, d_in, pca_k, g_hidden, s_hidden, b_init, layout):
     kg, ks = jax.random.split(key)
-    d_red = N_PHOT + 1 + pca_k
+    d_red = layout.spec_start + pca_k
     return {
         "theta": jnp.zeros((d_in,), jnp.float32),
         "b": jnp.float32(b_init),
-        "phi": jnp.zeros((N_PHOT,), jnp.float32),      # bilinear extinction, init 0
+        "phi": jnp.zeros((layout.n_phot,), jnp.float32),   # bilinear extinction, init 0
         "g": init_mlp(kg, d_red, g_hidden, zero_last=True),
         "s": init_mlp(ks, d_red, s_hidden, zero_last=True),
         "pi0": jnp.float32(0.0),                       # residual plx zero-point (mas)
@@ -112,19 +117,23 @@ def init_params(key, d_in, pca_k, g_hidden, s_hidden, b_init):
     }
 
 
-def forward(params, x, buf, key, dropout):
-    """x is RAW features; standardization happens here so buffers travel with the
-    jitted function. Returns (z, sig, gate, d, g). A enters the bilinear term
-    standardized — the shift is absorbed by theta's photometric block and the scale
-    by phi, so no generality is lost and the term stays O(1)."""
+def forward(params, x, buf, key, dropout, layout):
+    """x is RAW features (layout: [phot | A_rjce? | spec]); standardization happens
+    here so buffers travel with the jitted function. Returns (z, sig, gate, d, g).
+    A enters the bilinear term standardized — the shift is absorbed by theta's
+    photometric block and the scale by phi, so no generality is lost and the term
+    stays O(1). `layout` is static python ints -> one jit compile per layout."""
     x = (x - buf["mu"]) / buf["sd"]
-    spec = x[:, N_PHOT + 1:]
+    spec = x[:, layout.spec_start:]
     scores = (spec @ buf["V"]) / buf["scale"]
     d = jnp.mean(scores ** 2, axis=1)                  # hull score, ~1 inside
     gate = jax.nn.sigmoid((buf["tau"] - d) / buf["width"])
-    x_red = jnp.concatenate([x[:, :N_PHOT + 1], scores], axis=1)
+    x_red = jnp.concatenate([x[:, :layout.spec_start], scores], axis=1)
     z_lin = x @ params["theta"] + params["b"]
-    z_ext = x[:, N_PHOT] * (x[:, :N_PHOT] @ params["phi"])
+    if layout.has_aks:                                 # bilinear extinction drift
+        z_ext = x[:, layout.i_aks] * (x[:, :layout.n_phot] @ params["phi"])
+    else:                                              # no A_Ks feature -> no term
+        z_ext = 0.0
     kg = ks = None
     if key is not None:
         kg, ks = jax.random.split(key)
@@ -171,8 +180,8 @@ def anchor_nll(z, mu_anc, sig_anc, floor):
     return 0.5 * ((mu_anc - mu_pred) ** 2 / v + jnp.log(v))
 
 
-def penalties(params, g, l1_spec, l1_phi, lam_g):
-    return (l1_spec * jnp.abs(params["theta"][N_PHOT + 1:]).mean()
+def penalties(params, g, l1_spec, l1_phi, lam_g, layout):
+    return (l1_spec * jnp.abs(params["theta"][layout.spec_start:]).mean()
             + l1_phi * jnp.abs(params["phi"]).mean()
             + lam_g * (g ** 2).mean())
 
@@ -257,17 +266,23 @@ def load_anchors(path, ids, sample):
 # ----------------------------------------------------------------------
 # training
 # ----------------------------------------------------------------------
-def init_from_linear(params, npz_path):
+def init_from_linear(params, npz_path, layout, bands=None):
     """Warm-start theta/b from a run_full_gadi checkpoint. Its layout is
     [intercept | phot | spec] on ITS standardization stats; ours is
-    [phot | A | spec] on OURS. Same seed → same folds → stats agree to numerical
+    [phot | A? | spec] on OURS. Same seed → same folds → stats agree to numerical
     noise for the shared columns, so the map is: b ← theta[0], phot/spec ← shifted
-    by one for the inserted A column (its coefficient starts at 0)."""
+    for the inserted A column (its coefficient starts at 0). Refuses a checkpoint
+    whose band set differs from ours — a cross-dataset warm start would be
+    silently wrong."""
     lin = load_model(npz_path)
+    if bands is not None and lin["label_cols"] != list(bands):
+        raise SystemExit(
+            f"--init-linear {npz_path}: checkpoint bands {lin['label_cols']} != "
+            f"dataset bands {list(bands)} — cross-dataset warm start refused")
     th = lin["theta_all"].astype(np.float32)
     theta = np.zeros(params["theta"].shape, np.float32)
-    theta[:N_PHOT] = th[1:1 + N_PHOT]
-    theta[N_PHOT + 1:] = th[1 + N_PHOT:]
+    theta[:layout.n_phot] = th[1:1 + layout.n_phot]
+    theta[layout.spec_start:] = th[1 + layout.n_phot:]
     params = dict(params)
     params["theta"] = jnp.asarray(theta)
     params["b"] = jnp.float32(th[0])
@@ -275,24 +290,24 @@ def init_from_linear(params, npz_path):
     return params
 
 
-def make_step(stage, params, buf, args, has_anchor):
+def make_step(stage, params, buf, args, has_anchor, layout):
     """Build the jitted training step for one stage (masks + loss are static)."""
     tmask = trainable_mask(params, stage)
     wmask = decay_mask(params)
 
     def loss_fn(p, key, xb, yb, eb, a_x, a_mu, a_sig):
         kf, ka = jax.random.split(key)
-        z, sig, gate, d, g = forward(p, xb, buf, kf, args.dropout)
+        z, sig, gate, d, g = forward(p, xb, buf, kf, args.dropout, layout)
         if stage == 1:
             loss = warm_nll(z, yb, eb).mean()
         else:
             loss = field_nll(z, sig, p["pi0"], p["eps_logit"], yb, eb,
                              args.sig_bad, args.beta).mean()
         if has_anchor and stage >= 2:
-            za, _, _, _, _ = forward(p, a_x, buf, ka, args.dropout)
+            za, _, _, _, _ = forward(p, a_x, buf, ka, args.dropout, layout)
             loss = loss + args.w_anchor * anchor_nll(
                 za, a_mu, a_sig, args.anchor_floor).mean()
-        return loss + penalties(p, g, args.l1_spec, args.l1_phi, args.lam_g)
+        return loss + penalties(p, g, args.l1_spec, args.l1_phi, args.lam_g, layout)
 
     @jax.jit
     def step(p, opt, key, lr, xb, yb, eb, a_x, a_mu, a_sig):
@@ -304,14 +319,17 @@ def make_step(stage, params, buf, args, has_anchor):
 
 
 def train_fold(feats, train_mask, plx, err, mu, sd, anchors, fold_name, args,
-               label, log_cb=None):
+               label, layout, bands=None, log_cb=None):
     """Train one fold model through the staged schedule. anchors: the subset table
-    whose groups belong to this fold (or all groups for the all-train model)."""
+    whose groups belong to this fold (or all groups for the all-train model).
+    layout: the FeatureLayout of `feats`; bands: the DatasetSpec band names
+    (used to sanity-check --init-linear checkpoints)."""
     seed = args.seed + {"A": 1, "B": 2, "all": 0}[fold_name]
     key = jax.random.PRNGKey(seed)
 
     idx_all = np.where(train_mask)[0]
-    spec_std = ((feats[idx_all, N_PHOT + 1:] - mu[N_PHOT + 1:]) / sd[N_PHOT + 1:])
+    ss = layout.spec_start
+    spec_std = ((feats[idx_all, ss:] - mu[ss:]) / sd[ss:])
     V, scale = fit_pca(spec_std, args.pca_k, seed)
     del spec_std
     buf = {"mu": jnp.asarray(mu), "sd": jnp.asarray(sd),
@@ -324,9 +342,9 @@ def train_fold(feats, train_mask, plx, err, mu, sd, anchors, fold_name, args,
     params = init_params(kinit, feats.shape[1], args.pca_k,
                          tuple(int(h) for h in args.g_hidden.split(",") if h),
                          tuple(int(h) for h in args.s_hidden.split(",") if h),
-                         math.log(max(med, 1e-3)))
+                         math.log(max(med, 1e-3)), layout)
     if args.init_linear:
-        params = init_from_linear(params, args.init_linear)
+        params = init_from_linear(params, args.init_linear, layout, bands)
 
     # anchor tensors are tiny; standardization happens inside forward()
     if anchors is not None and len(anchors["rows"]):
@@ -353,7 +371,7 @@ def train_fold(feats, train_mask, plx, err, mu, sd, anchors, fold_name, args,
         n_ep = stage_epochs[stage]
         if n_ep == 0:
             continue
-        step = make_step(stage, params, buf, args, has_anchor)
+        step = make_step(stage, params, buf, args, has_anchor, layout)
         opt = adam_init(params)
         sidx = stage_idx[stage]
         n = sidx.size
@@ -391,11 +409,11 @@ def train_fold(feats, train_mask, plx, err, mu, sd, anchors, fold_name, args,
     return params, buf
 
 
-def predict_v2(params, buf, feats, idx, batch=65536):
+def predict_v2(params, buf, feats, idx, layout, batch=65536):
     """(plx_sp, sig_sp, gate, hull_d) for feats[idx]. plx_sp EXCLUDES pi0 — pi0 is
     a Gaia-frame nuisance, not a property of the star. Final batch is padded so
     the jitted forward compiles exactly once."""
-    fwd = jax.jit(lambda p, x: forward(p, x, buf, None, 0.0))
+    fwd = jax.jit(lambda p, x: forward(p, x, buf, None, 0.0, layout))
     idx = np.asarray(idx)
     out = {k: np.empty(idx.size, np.float64) for k in ("m", "s", "gate", "d")}
     for i in range(0, idx.size, batch):

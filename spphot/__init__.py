@@ -13,4 +13,7 @@ Package layout (see CODE_MAP.md for the paper-plan mapping):
 Deliberately imports nothing heavy here: torch lives only in spphot.nn, jax only
 in spphot.v2, matplotlib only in spphot.plots.
 """
+from spphot.datasets import (AuxPhot, DatasetSpec, FeatureLayout,   # noqa: F401
+                             REGISTRY, get_dataset, resolve_dataset)
+
 __version__ = "0.1.0"

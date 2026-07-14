@@ -20,6 +20,7 @@ import math, time
 import numpy as np
 
 from spphot.data import log, load_metadata, build_lnflux_streaming, load_pixel_masks
+from spphot.datasets import REGISTRY, resolve_dataset
 
 import torch
 import torch.nn as nn
@@ -194,17 +195,20 @@ def predict_nn(model, feats, idx, mu, sd, device, batch=65536):
 # ----------------------------------------------------------------------
 # checkpoint I/O + apply-time inference (this module owns the .pt schema)
 # ----------------------------------------------------------------------
-def save_nn_checkpoint(path, model, mu, sd, good, *, hidden, dropout, label_cols,
-                       snr_min, bad_frac, seed, std_factor, **meta):
+def save_nn_checkpoint(path, model, mu, sd, good, *, hidden, dropout,
+                       snr_min, bad_frac, seed, std_factor,
+                       dataset=REGISTRY["dr17"], **meta):
     """Write the train_nn checkpoint: weights + standardization + good-pixel mask
-    + feature provenance, so load_bundle()/apply_to_parquet() reproduce the exact
-    training preprocessing on new stars."""
+    + feature provenance (dataset name, band list, phot-block layout), so
+    load_bundle()/apply_to_parquet() reproduce the exact training preprocessing
+    on new stars."""
     torch.save({
         "state_dict": model.state_dict(),
         "mu": mu, "sd": sd,
         "good_pixel_mask": good,
         "hidden": list(hidden), "dropout": dropout,
-        "label_cols": list(label_cols), "d_in": int(mu.shape[0]),
+        "label_cols": list(dataset.bands), "d_in": int(mu.shape[0]),
+        "dataset": dataset.name, "phot_cols": list(dataset.phot_cols),
         "snr_min": snr_min, "bad_frac": bad_frac, "seed": seed,
         "std_factor": std_factor, **meta,
     }, path)
@@ -243,11 +247,15 @@ def load_bundle(model_path, pixel_mask_dir=None, device="auto"):
     sd = np.asarray(ckpt["sd"], np.float32)
     std_factor = float(ckpt.get("std_factor", 1.0))
     label_cols = list(ckpt["label_cols"])
+    # dataset back-compat: old checkpoints stored only label_cols
+    ds = resolve_dataset(ckpt.get("dataset"), label_cols)
+    phot_cols = list(ckpt.get("phot_cols", ds.phot_cols))
     hidden = tuple(ckpt["hidden"])
     dropout = float(ckpt.get("dropout", 0.0))
     d_in = int(ckpt["d_in"])
     log(f"loaded NN: good pixels={int(good.sum())}, d_in={d_in}, hidden={hidden}, "
-        f"std_factor={std_factor:.3f}, loss={ckpt.get('loss')}, device={device}")
+        f"std_factor={std_factor:.3f}, loss={ckpt.get('loss')}, "
+        f"dataset={ds.name}, device={device}")
 
     model = HetMLP(d_in, hidden, dropout).to(device)
     model.load_state_dict(ckpt["state_dict"])
@@ -256,28 +264,34 @@ def load_bundle(model_path, pixel_mask_dir=None, device="auto"):
     return {
         "model": model, "good": good, "mu": mu, "sd": sd,
         "std_factor": std_factor, "label_cols": label_cols, "d_in": d_in,
+        "dataset": ds, "phot_cols": phot_cols,
         "tel_masks": load_pixel_masks(pixel_mask_dir), "device": device,
     }
 
 
 def apply_to_parquet(bundle, parquet, allstar, *, out=None, cluster_name=None,
-                     cluster_col=None, f_max=2.0, batch_rows=20000):
+                     cluster_col=None, f_max=2.0, batch_rows=20000,
+                     aux_phot_path=None):
     """Infer plx_sp/err_sp for one spectra parquet with a preloaded `bundle`.
 
     Mirrors training feature assembly exactly (saved pixel mask + telescope lit
-    masks + saved standardization). Writes `out` if given and returns the result
+    masks + saved standardization + the checkpoint's dataset spec, so the phot
+    block has the training band order — pass aux_phot_path if training used an
+    aux photometry table). Writes `out` if given and returns the result
     DataFrame so a caller can concatenate clusters for the test without re-reading.
     """
     import pandas as pd
 
     model, good, mu, sd = bundle["model"], bundle["good"], bundle["mu"], bundle["sd"]
-    std_factor, label_cols, d_in = bundle["std_factor"], bundle["label_cols"], bundle["d_in"]
+    std_factor, d_in = bundle["std_factor"], bundle["d_in"]
     tel_masks, device = bundle["tel_masks"], bundle["device"]
+    ds, phot_cols = bundle["dataset"], bundle["phot_cols"]
 
-    merged, n_parquet = load_metadata(parquet, allstar)
+    merged, n_parquet = load_metadata(parquet, allstar, ds, aux_phot_path)
 
-    phot_all = merged[label_cols].to_numpy(float)
-    keep = np.isfinite(phot_all).all(axis=1)
+    phot_all = merged[phot_cols].to_numpy(float)
+    # completeness cut on the BANDS only (survey_ind is a constructed 0/1 flag)
+    keep = np.isfinite(phot_all[:, :len(ds.bands)]).all(axis=1)
     log(f"keep (complete photometry): {int(keep.sum())} / {n_parquet}")
 
     # spectra on the SAVED pixel mask + telescope lit masks (identical to training)

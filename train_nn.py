@@ -21,6 +21,7 @@ import os, math, argparse
 import numpy as np
 
 from spphot.data import LABEL_COLS, log, prepare_sample                     # noqa: F401
+from spphot.datasets import REGISTRY, get_dataset
 from spphot.nn import (LOG_SIG_MIN, LOG_SIG_MAX, HetMLP, het_nll,           # noqa: F401
                        studentt_nll, clamp_saturation, standardize_fit,
                        train_fold, predict_nn, save_nn_checkpoint)
@@ -63,6 +64,10 @@ def main():
     ap.add_argument("--bad-frac", type=float, default=0.01)
     ap.add_argument("--batch-rows", type=int, default=20000)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--dataset", default="dr17", choices=sorted(REGISTRY),
+                    help="photometry dataset spec (spphot.datasets registry)")
+    ap.add_argument("--aux-phot", default=None,
+                    help="auxiliary photometry parquet (dataset must declare aux_phot)")
     # NN hyper-parameters
     ap.add_argument("--hidden", default="1024,512,256",
                     help="comma-separated MLP widths")
@@ -104,17 +109,21 @@ def main():
 
     # ---- identical sample/features/splits as the linear pipeline. Built ONCE and
     #      reused across every sweep config (this is the expensive step). ----
-    S = prepare_sample(args.parquet, args.allstar, snr_min=args.snr_min,
+    spec_ds = get_dataset(args.dataset)
+    S = prepare_sample(args.parquet, args.allstar, dataset=spec_ds,
+                       aux_phot_path=args.aux_phot, snr_min=args.snr_min,
                        bad_frac=args.bad_frac, batch_rows=args.batch_rows,
                        pixel_mask_dir=args.pixel_mask_dir, seed=args.seed)
     spec = S["spec"]
+    n_phot = S["n_phot"]
     # features = [photometry | ln-flux]; float32 for the net (frees the separate spec)
     feats = np.hstack([S["phot"].astype(np.float32), spec]).astype(np.float32, copy=False)
     del spec, S["spec"]
     plx_k, err_k = S["plx"], S["err"]
     samp_k, train_k = S["sample"], S["train"]
     ids_k = S["ids"]
-    log(f"features: {feats.shape[0]} stars x {feats.shape[1]} (phot 8 + spec {feats.shape[1]-8})")
+    log(f"features: {feats.shape[0]} stars x {feats.shape[1]} "
+        f"(phot {n_phot} + spec {feats.shape[1]-n_phot})")
 
     A = train_k & (samp_k == "A")
     B = train_k & (samp_k == "B")
@@ -186,7 +195,7 @@ def main():
 
         save_nn_checkpoint(model_out, model_all, muAll, sdAll, S["good"],
                            hidden=hidden, dropout=args.dropout,
-                           label_cols=LABEL_COLS, snr_min=args.snr_min,
+                           dataset=spec_ds, snr_min=args.snr_min,
                            bad_frac=args.bad_frac, seed=args.seed,
                            std_factor=std_factor, **meta)
         log(f"wrote {out_path}  ({len(plx_k)} stars); saved model -> {model_out}")

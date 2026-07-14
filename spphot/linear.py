@@ -7,7 +7,8 @@ cross-validated lambda-scan metric, and self-contained .npz model persistence.
 from __future__ import annotations
 import numpy as np
 
-from spphot.data import LABEL_COLS, log
+from spphot.data import log
+from spphot.datasets import REGISTRY, resolve_dataset
 import spphot.eval as E
 
 
@@ -194,12 +195,13 @@ def cv_fold_scatter(phot_tr, spec_tr, plx_tr, err_tr, fold_tr, lam, clip_sigma=0
 # model persistence — one self-contained, re-loadable artifact
 # ----------------------------------------------------------------------
 def save_model(path, *, theta_all, stats_all, theta_A, stats_A, theta_B, stats_B,
-               good, frac_sigma, config, tel_masks=None):
+               good, frac_sigma, config, tel_masks=None, dataset=REGISTRY["dr17"]):
     """Everything needed to predict on NEW stars without refitting: the all-train
     model (theta + standardization), the good-pixel mask, the adopted fractional
-    error, the feature order, and the build config. The fold models are kept too
-    so the A/B cross-validation is reproducible. The per-telescope pixel masks are
-    embedded so apply-time imputation matches training. Load with load_model()."""
+    error, the feature order (dataset name + band list), and the build config.
+    The fold models are kept too so the A/B cross-validation is reproducible.
+    The per-telescope pixel masks are embedded so apply-time imputation matches
+    training. Load with load_model()."""
     extra = {}
     if tel_masks:                                  # one array per telescope + the tag list
         extra["tel_mask_tags"] = np.array(list(tel_masks))
@@ -214,7 +216,9 @@ def save_model(path, *, theta_all, stats_all, theta_A, stats_A, theta_B, stats_B
         theta_A=theta_A, mu_A=stats_A[0], sd_A=stats_A[1],
         theta_B=theta_B, mu_B=stats_B[0], sd_B=stats_B[1],
         # provenance / build settings so apply-time normalization matches
-        label_cols=np.array(LABEL_COLS),
+        label_cols=np.array(dataset.bands),
+        dataset=np.array(dataset.name),
+        phot_cols=np.array(dataset.phot_cols),
         lam=np.float64(config["lam"]), f_max=np.float64(config["f_max"]),
         bad_frac=np.float64(config["bad_frac"]), snr_min=np.float64(config["snr_min"]),
         clip_sigma=np.float64(config.get("clip_sigma", 0.0)),
@@ -225,17 +229,24 @@ def save_model(path, *, theta_all, stats_all, theta_A, stats_A, theta_B, stats_B
 
 def load_model(path):
     """Return a dict with theta_all, stats_all=(mu,sd), good_pixel_mask, frac_sigma,
-    f_max, bad_frac, label_cols — the pieces apply_model.py needs."""
+    f_max, bad_frac, label_cols, dataset (a DatasetSpec; resolved from the saved
+    name, or from label_cols for pre-dataset checkpoints) — the pieces apply-time
+    prediction needs."""
     z = np.load(path, allow_pickle=False)
     tel_masks = None
     if "tel_mask_tags" in z.files:
         tel_masks = {str(t): z[f"tel_mask_{t}"].astype(bool) for t in z["tel_mask_tags"]}
+    label_cols = [str(c) for c in z["label_cols"]]
+    ds = resolve_dataset(str(z["dataset"]) if "dataset" in z.files else None, label_cols)
     return {
         "theta_all": z["theta_all"], "stats_all": (z["mu_all"], z["sd_all"]),
         "theta_A": z["theta_A"], "stats_A": (z["mu_A"], z["sd_A"]),
         "theta_B": z["theta_B"], "stats_B": (z["mu_B"], z["sd_B"]),
         "good_pixel_mask": z["good_pixel_mask"], "frac_sigma": float(z["frac_sigma"]),
         "f_max": float(z["f_max"]), "bad_frac": float(z["bad_frac"]),
-        "label_cols": [str(c) for c in z["label_cols"]],
+        "label_cols": label_cols,
+        "dataset": ds,
+        "phot_cols": ([str(c) for c in z["phot_cols"]] if "phot_cols" in z.files
+                      else list(ds.phot_cols)),
         "tel_masks": tel_masks,
     }

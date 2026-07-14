@@ -17,7 +17,11 @@ from __future__ import annotations
 import os, time
 import numpy as np
 
-LABEL_COLS = ["g_mag", "bp_mag", "rp_mag", "j_mag", "h_mag", "k_mag", "w1_mag", "w2_mag"]
+from spphot.datasets import REGISTRY, get_dataset
+
+# back-compat aliases: the photometry bands are now defined by the dataset
+# registry (spphot.datasets); these mirror the default 'dr17' spec.
+LABEL_COLS = list(REGISTRY["dr17"].bands)
 META_COLS  = ["sdss_id", "plx", "e_plx", *LABEL_COLS, "r_med_photogeo"]
 
 
@@ -70,25 +74,28 @@ def load_apogee_windows(path, width):
 # ----------------------------------------------------------------------
 # metadata: allStar FITS  +  parquet scalar columns, merged on sdss_id
 # ----------------------------------------------------------------------
-def load_metadata(parquet_path, allstar_path):
+def load_metadata(parquet_path, allstar_path, dataset="dr17", aux_phot_path=None):
     import pandas as pd
     import pyarrow.parquet as pq
     from astropy.io import fits
 
+    spec_ds = get_dataset(dataset)
+    meta_cols = ["sdss_id", "plx", "e_plx", *spec_ds.bands, "r_med_photogeo"]
+
     log("reading allStar metadata table ...")
     a = fits.open(allstar_path)[2].data            # extension 2 holds the table
-    allstar = pd.DataFrame({c: np.asarray(a[c]) for c in META_COLS})
+    allstar = pd.DataFrame({c: np.asarray(a[c]) for c in meta_cols})
     for c in allstar.columns:                      # FITS is big-endian; pandas wants native
         arr = allstar[c].values
         if getattr(arr.dtype, "byteorder", "=") == ">":
             allstar[c] = arr.astype(arr.dtype.newbyteorder("="))
 
     # astra allStar has one row per spectrum/reduction, so a star (sdss_id) can
-    # appear several times; META_COLS are per-star quantities, so keep one row
+    # appear several times; meta_cols are per-star quantities, so keep one row
     # per star — preferring the most complete one in case duplicates carry NaNs.
     n_dup = int(allstar["sdss_id"].duplicated().sum())
     if n_dup:
-        completeness = allstar[["plx", "e_plx", *LABEL_COLS]].notna().sum(axis=1)
+        completeness = allstar[["plx", "e_plx", *spec_ds.bands]].notna().sum(axis=1)
         allstar = (allstar.assign(_complete=completeness)
                    .sort_values("_complete", ascending=False, kind="stable")
                    .drop_duplicates("sdss_id")
@@ -113,6 +120,29 @@ def load_metadata(parquet_path, allstar_path):
     assert len(merged) == n_parquet, "merge changed row count (duplicate sdss_id in allStar?)"
     log(f"metadata: {n_parquet} parquet rows, "
         f"{merged['plx'].notna().sum()} with allStar match")
+
+    # ---- auxiliary photometry (e.g. VVV/VIRAC2): override survey bands ----
+    if spec_ds.aux_phot is not None and aux_phot_path:
+        ax = spec_ds.aux_phot
+        aux = (pq.read_table(aux_phot_path,
+                             columns=[ax.join_key, *[c for _, c in ax.columns]])
+               .to_pandas().drop_duplicates(ax.join_key))
+        merged = merged.merge(aux, on=ax.join_key, how="left")
+        assert len(merged) == n_parquet, "aux-phot merge changed row count"
+        used = np.ones(len(merged), bool)
+        for band, aux_col in ax.columns:
+            v = merged[aux_col].to_numpy(float)
+            ok = np.isfinite(v)
+            merged[band] = np.where(ok, v, merged[band].to_numpy(float))
+            used &= ok
+        merged["survey_ind"] = used.astype(float)   # 1 = all overridden bands from aux
+        log(f"aux phot: {int(used.sum())}/{n_parquet} stars fully overridden "
+            f"from {aux_phot_path} ({', '.join(b for b, _ in ax.columns)})")
+    elif spec_ds.survey_indicator:
+        merged["survey_ind"] = 0.0
+    elif aux_phot_path:
+        log(f"NOTE: --aux-phot given but dataset '{spec_ds.name}' declares no "
+            f"aux_phot -> ignored")
     return merged, n_parquet
 
 
@@ -223,24 +253,32 @@ def build_lnflux_streaming(parquet_path, keep_mask, f_max=2.0, bad_frac_max=0.01
 # ----------------------------------------------------------------------
 # sample assembly — shared by the linear fit and the NN workflow
 # ----------------------------------------------------------------------
-def prepare_sample(parquet, allstar, *, snr_min=100.0, bad_frac=0.01,
-                   batch_rows=20000, pixel_mask_dir=None, seed=42):
+def prepare_sample(parquet, allstar, *, dataset="dr17", aux_phot_path=None,
+                   snr_min=100.0, bad_frac=0.01, batch_rows=20000,
+                   pixel_mask_dir=None, seed=42):
     """Load + assemble the modelling sample once, so every model (linear or NN) is
     trained and scored on identical features/targets/splits: allStar+parquet
-    metadata, the Gaia parallax zero-point (plx_corr = plx - zeropoint), the
-    per-telescope lit-pixel masks, the quality-cut training set (no parallax/S-N
-    cut), a reproducible A/B split, and the streamed ln-flux matrix.
+    metadata (photometry per the DatasetSpec, optionally aux-overridden), the
+    Gaia parallax zero-point (plx_corr = plx - zeropoint), the per-telescope
+    lit-pixel masks, the quality-cut training set (no parallax/S-N cut), a
+    reproducible A/B split, and the streamed ln-flux matrix.
 
     Returns a dict of kept-row arrays (parquet row order, restricted to stars with
     complete photometry):
-        phot (n,8)  spec (n,L)  plx err  plx_raw zeropoint  sample('A'/'B')
-        train(bool)  ids  dist_bj  star_bad   plus good(Lfull,), tel_masks, n_parquet
+        phot (n,n_phot)  spec (n,L)  plx err  plx_raw zeropoint  sample('A'/'B')
+        train(bool)  ids  dist_bj  star_bad
+    plus good(Lfull,), tel_masks, n_parquet, and the provenance echo:
+        dataset (the DatasetSpec), phot_cols (feature order), n_phot.
+    (The key is "dataset", NOT "spec" — callers `del S["spec"]` to free the
+    spectra matrix.)
     """
+    spec_ds = get_dataset(dataset)
     tel_masks = load_pixel_masks(pixel_mask_dir)
-    merged, n_parquet = load_metadata(parquet, allstar)
+    merged, n_parquet = load_metadata(parquet, allstar, spec_ds, aux_phot_path)
 
-    phot_all = merged[LABEL_COLS].to_numpy(float)
-    keep = np.isfinite(phot_all).all(axis=1)
+    phot_all = merged[list(spec_ds.phot_cols)].to_numpy(float)
+    # completeness cut on the BANDS only (survey_ind is a constructed 0/1 flag)
+    keep = np.isfinite(phot_all[:, :len(spec_ds.bands)]).all(axis=1)
     log(f"keep (complete photometry): {keep.sum()} / {n_parquet}")
 
     # zero-point: plx_corr = plx - zeropoint (NaN for non-5/6-param sources -> the
@@ -279,4 +317,6 @@ def prepare_sample(parquet, allstar, *, snr_min=100.0, bad_frac=0.01,
         "dist_bj": merged["r_med_photogeo"].to_numpy(float)[keep],
         "star_bad": star_bad, "good": good, "tel_masks": tel_masks,
         "n_parquet": n_parquet,
+        "dataset": spec_ds, "phot_cols": list(spec_ds.phot_cols),
+        "n_phot": spec_ds.n_phot,
     }

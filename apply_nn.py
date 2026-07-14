@@ -47,12 +47,16 @@ def main():
                     help="bad-pixel flux clip; must match training (default 2.0)")
     ap.add_argument("--batch-rows", type=int, default=20000)
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    ap.add_argument("--aux-phot", default=None,
+                    help="auxiliary photometry parquet — required if the checkpoint "
+                         "was trained on an aux-phot dataset")
     args = ap.parse_args()
 
     bundle = load_bundle(args.model, args.pixel_mask_dir, args.device)
     apply_to_parquet(bundle, args.parquet, args.allstar, out=args.out,
                      cluster_name=args.cluster_name, cluster_col=args.cluster_col,
-                     f_max=args.f_max, batch_rows=args.batch_rows)
+                     f_max=args.f_max, batch_rows=args.batch_rows,
+                     aux_phot_path=args.aux_phot)
 
 
 if __name__ == "__main__":

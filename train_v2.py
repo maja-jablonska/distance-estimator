@@ -26,7 +26,8 @@ import os, json, argparse
 import numpy as np
 
 from spphot.data import LABEL_COLS, log, prepare_sample                     # noqa: F401
-from spphot.v2 import (N_PHOT, rjce_aks, load_anchors, standardize_fit,     # noqa: F401
+from spphot.datasets import REGISTRY, FeatureLayout, get_dataset
+from spphot.v2 import (rjce_aks, load_anchors, standardize_fit,             # noqa: F401
                        train_fold, predict_v2, save_checkpoint)
 import spphot.eval as E
 
@@ -45,6 +46,10 @@ def main():
     ap.add_argument("--bad-frac", type=float, default=0.01)
     ap.add_argument("--batch-rows", type=int, default=20000)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--dataset", default="dr17", choices=sorted(REGISTRY),
+                    help="photometry dataset spec (spphot.datasets registry)")
+    ap.add_argument("--aux-phot", default=None,
+                    help="auxiliary photometry parquet (dataset must declare aux_phot)")
     # architecture
     ap.add_argument("--pca-k", type=int, default=128,
                     help="reduced spectral dims for the gate + residual net")
@@ -96,18 +101,29 @@ def main():
         f"pca_k={args.pca_k}  beta={args.beta}")
 
     # ---- identical sample as the linear baseline / train_nn ----
-    S = prepare_sample(args.parquet, args.allstar, snr_min=args.snr_min,
+    spec_ds = get_dataset(args.dataset)
+    S = prepare_sample(args.parquet, args.allstar, dataset=spec_ds,
+                       aux_phot_path=args.aux_phot, snr_min=args.snr_min,
                        bad_frac=args.bad_frac, batch_rows=args.batch_rows,
                        pixel_mask_dir=args.pixel_mask_dir, seed=args.seed)
     phot = S["phot"].astype(np.float32)
-    a_ks = rjce_aks(phot).astype(np.float32)
-    feats = np.hstack([phot, a_ks[:, None], S["spec"]]).astype(np.float32, copy=False)
+    rjce_idx = spec_ds.rjce_indices()
+    layout = FeatureLayout(n_phot=S["n_phot"], has_aks=rjce_idx is not None)
+    if rjce_idx is not None:
+        a_ks = rjce_aks(phot, rjce_idx).astype(np.float32)
+        feats = np.hstack([phot, a_ks[:, None], S["spec"]]).astype(np.float32, copy=False)
+        aks_msg = (f"A_Ks(rjce) median {np.median(a_ks):.3f}, "
+                   f"p95 {np.percentile(a_ks, 95):.3f}")
+    else:
+        a_ks = np.full(len(phot), np.nan, np.float32)
+        feats = np.hstack([phot, S["spec"]]).astype(np.float32, copy=False)
+        aks_msg = "no RJCE pair in this dataset -> bilinear extinction term disabled"
     del S["spec"]
     plx_k, err_k = S["plx"], S["err"]
     samp_k, train_k, ids_k = S["sample"].copy(), S["train"], S["ids"]
-    log(f"features: {feats.shape[0]} x {feats.shape[1]} (phot {N_PHOT} + A_rjce 1 + "
-        f"spec {feats.shape[1]-N_PHOT-1});  A_Ks(rjce) median "
-        f"{np.median(a_ks):.3f}, p95 {np.percentile(a_ks, 95):.3f}")
+    log(f"features: {feats.shape[0]} x {feats.shape[1]} (phot {layout.n_phot} + "
+        f"A_rjce {int(layout.has_aks)} + spec {feats.shape[1]-layout.spec_start});  "
+        + aks_msg)
 
     anchors = load_anchors(args.anchors, ids_k, samp_k) if args.anchors else None
 
@@ -138,7 +154,7 @@ def main():
         fold_name = folds[0] if len(folds) == 1 else "all"
         params, buf = train_fold(feats, mask, plx_k, err_k, mu, sd,
                                  anchor_subset(folds), fold_name, args, label,
-                                 log_cb=cb)
+                                 layout, bands=spec_ds.bands, log_cb=cb)
         return params, buf
 
     log("=== training fold models (staged) ===")
@@ -151,7 +167,7 @@ def main():
         for mask, params, buf in triples:
             idx = np.where(mask)[0]
             if idx.size:
-                m, s, gt, d = predict_v2(params, buf, feats, idx)
+                m, s, gt, d = predict_v2(params, buf, feats, idx, layout)
                 for k, v in zip(("m", "s", "gate", "d"), (m, s, gt, d)):
                     cols[k][idx] = v
         return cols
@@ -177,7 +193,11 @@ def main():
     model_out = args.model_out or os.path.splitext(args.out)[0] + "_model.npz"
     save_checkpoint(model_out, par_all, buf_all, {
         "good_pixel_mask": S["good"],
-        "label_cols": np.array(LABEL_COLS),
+        "label_cols": np.array(spec_ds.bands),
+        "dataset": np.array(spec_ds.name),
+        "phot_cols": np.array(spec_ds.phot_cols),
+        "n_phot": np.int64(layout.n_phot),
+        "has_aks": np.bool_(layout.has_aks),
         "args_json": np.array(json.dumps(vars(args))),
     })
     log(f"wrote {args.out} ({len(plx_k)} stars); saved model -> {model_out}")

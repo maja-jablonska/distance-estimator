@@ -58,6 +58,7 @@ def check_linear(fix):
     assert int(m["good_pixel_mask"].sum()) == EXPECTED_GOOD, \
         f"good pixels {int(m['good_pixel_mask'].sum())} != {EXPECTED_GOOD}"
     assert m["tel_masks"] is not None and set(m["tel_masks"]) == {"apo25m", "lco25m"}
+    assert m["dataset"].name == "dr17", m["dataset"]
     print(f"linear OK: {len(df)} stars, good={EXPECTED_GOOD}, "
           f"scatter(plx_sp/plx-1) exercised")
 
@@ -70,10 +71,11 @@ def check_nn(fix):
     ckpt = torch.load(os.path.join(fix, "out_nn_model.pt"),
                       map_location="cpu", weights_only=False)
     for k in ("state_dict", "mu", "sd", "good_pixel_mask", "label_cols", "d_in",
-              "hidden", "std_factor"):
+              "hidden", "std_factor", "dataset", "phot_cols"):
         assert k in ckpt, f"nn checkpoint missing key {k}"
     assert int(ckpt["d_in"]) == 8 + EXPECTED_GOOD, ckpt["d_in"]
-    print(f"nn OK: {len(df)} stars, d_in={ckpt['d_in']}")
+    assert ckpt["dataset"] == "dr17", ckpt["dataset"]
+    print(f"nn OK: {len(df)} stars, d_in={ckpt['d_in']}, dataset={ckpt['dataset']}")
 
 
 def check_v2(fix):
@@ -84,10 +86,12 @@ def check_v2(fix):
         assert col in df.columns, f"v2 parquet missing {col}"
     z = np.load(os.path.join(fix, "out_v2_model.npz"), allow_pickle=False)
     for k in ("theta", "b", "phi", "pca_V", "mu", "sd", "good_pixel_mask",
-              "label_cols"):
+              "label_cols", "dataset", "phot_cols", "n_phot", "has_aks"):
         assert k in z.files, f"v2 checkpoint missing {k}"
     assert z["theta"].shape[0] == 8 + 1 + EXPECTED_GOOD, z["theta"].shape
-    print(f"v2 OK: {len(df)} stars, theta dim={z['theta'].shape[0]}")
+    assert str(z["dataset"]) == "dr17" and int(z["n_phot"]) == 8 and bool(z["has_aks"])
+    print(f"v2 OK: {len(df)} stars, theta dim={z['theta'].shape[0]}, "
+          f"dataset={z['dataset']}")
 
 
 def check_applied(fix, name="fake1_nn.parquet"):

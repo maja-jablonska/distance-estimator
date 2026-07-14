@@ -24,6 +24,7 @@ import numpy as np
 from spphot.data import (LABEL_COLS, META_COLS, TELESCOPES, log,           # noqa: F401
                          load_pixel_masks, load_apogee_windows, load_metadata,
                          build_lnflux_streaming, prepare_sample)
+from spphot.datasets import REGISTRY, get_dataset
 from spphot.linear import (design, fit_parallax_model, predict,            # noqa: F401
                            cv_fold_scatter, save_model, load_model)
 import spphot.eval as E
@@ -53,10 +54,16 @@ def main():
                     help="dir with per-telescope pixel_lit_mask_<tel>.npy; keeps only "
                          "lit pixels (intersected with the data-quality mask)")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--dataset", default="dr17", choices=sorted(REGISTRY),
+                    help="photometry dataset spec (spphot.datasets registry)")
+    ap.add_argument("--aux-phot", default=None,
+                    help="auxiliary photometry parquet (dataset must declare aux_phot)")
     args = ap.parse_args()
     import pandas as pd
 
-    S = prepare_sample(args.parquet, args.allstar, snr_min=args.snr_min,
+    spec_ds = get_dataset(args.dataset)
+    S = prepare_sample(args.parquet, args.allstar, dataset=spec_ds,
+                       aux_phot_path=args.aux_phot, snr_min=args.snr_min,
                        bad_frac=args.bad_frac, batch_rows=args.batch_rows,
                        pixel_mask_dir=args.pixel_mask_dir, seed=args.seed)
     phot_k, X_spec = S["phot"], S["spec"]
@@ -150,6 +157,7 @@ def main():
                theta_all=theta_all, stats_all=stats_all,
                theta_A=theta_A, stats_A=stats_A, theta_B=theta_B, stats_B=stats_B,
                good=good, frac_sigma=frac_sigma, tel_masks=tel_masks,
+               dataset=spec_ds,
                config={"lam": args.lam, "f_max": 2.0, "bad_frac": args.bad_frac,
                        "snr_min": args.snr_min, "clip_sigma": args.clip_sigma,
                        "seed": args.seed})
