@@ -3,10 +3,15 @@
 Cross-match stars in a parquet file against VIRAC2 via the ESO TAP service.
 
 Usage:
-    python virac2_xmatch.py targets.parquet out_virac2.parquet \
+    python vvv.py targets.parquet out_virac2.parquet \
         --id-col APOGEE_ID --ra-col RA --dec-col DEC --radius 0.3
 
 Notes:
+- Only the id/ra/dec columns are read from targets.parquet, and the OUTPUT is
+  the slim crossmatch table (id, ra, dec, VIRAC2 columns, sep_arcsec,
+  n_in_radius) keyed by --id-col — i.e. exactly the aux-photometry table
+  spphot.datasets.AuxPhot consumes. Join it onto anything else by id later;
+  never haul the spectra columns through this script.
 - Positions are uploaded in chunks (TAP upload limits + politeness).
 - Run discover mode first to confirm the VIRAC2 table/column names in
   the ESO tabular TAP schema, then set VIRAC2_TABLE below:
@@ -93,14 +98,23 @@ def main():
     if not (args.parquet_in and args.parquet_out):
         sys.exit("Provide input and output parquet paths.")
 
-    df = pd.read_parquet(args.parquet_in)
+    # Read ONLY the three columns the crossmatch needs — the bulge parquets
+    # carry spectra list-columns that decompress to tens of GB, and a full
+    # pd.read_parquet gets OOM-killed on a login node before --head applies.
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(args.parquet_in)
+    avail = set(pf.schema_arrow.names)
+    cols = [args.id_col, args.ra_col, args.dec_col]
+    missing = [c for c in cols if c not in avail]
+    if missing:
+        sys.exit(f"Column(s) {missing} not in {args.parquet_in}. "
+                 f"Available: {sorted(avail)}")
     if args.head is not None:
-        df = df.head(args.head)
+        batch = next(pf.iter_batches(batch_size=args.head, columns=cols))
+        df = batch.to_pandas()
         print(f"TEST MODE: using first {len(df)} rows of {args.parquet_in}")
-    for col in (args.id_col, args.ra_col, args.dec_col):
-        if col not in df.columns:
-            sys.exit(f"Column '{col}' not in {args.parquet_in}. "
-                     f"Available: {list(df.columns)}")
+    else:
+        df = pq.read_table(args.parquet_in, columns=cols).to_pandas()
 
     work = pd.DataFrame({
         "_uid": df[args.id_col].astype(str),
@@ -138,6 +152,8 @@ def main():
     matched = (matched.sort_values("sep_arcsec")
                       .drop_duplicates("_uid", keep="first"))
 
+    # slim aux-phot table: one row per input target, VIRAC2 cols NaN where unmatched
+    df[args.id_col] = df[args.id_col].astype(str)
     out = df.merge(matched.rename(columns={"_uid": args.id_col}),
                    on=args.id_col, how="left")
     out.to_parquet(args.parquet_out, index=False)
