@@ -4,6 +4,7 @@ spphot_data/
 xmatch.fits
 allStar*.fits
 clusters/
+tests/fixture/
 
 # python
 __pycache__/
