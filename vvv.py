@@ -12,18 +12,23 @@ Notes:
   n_in_radius) keyed by --id-col — i.e. exactly the aux-photometry table
   spphot.datasets.AuxPhot consumes. Join it onto anything else by id later;
   never haul the spectra columns through this script.
-- Positions are uploaded in chunks (TAP upload limits + politeness).
+- RESUMABLE: every finished chunk is cached in <out>.parts/, so a killed run
+  (copyq walltime!) re-run with the same arguments skips straight to the
+  remaining chunks. On full success the parts dir is removed. See vvv.pbs.
 - Run discover mode first to confirm the VIRAC2 table/column names in
-  the ESO tabular TAP schema, then set VIRAC2_TABLE below:
-      python virac2_xmatch.py --discover
+  the ESO tabular TAP schema, then pass --table:
+      python vvv.py --discover
 - If your RA/DEC are Gaia DR3 (epoch J2016.0) you are already on the
   VIRAC2 reference frame; 0.3 arcsec is a sensible radius. If they are
   2MASS positions (epoch ~2000), widen to ~1 arcsec or propagate first.
 """
 
 import argparse
+import json
+import os
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -149,6 +154,14 @@ def main():
     ap.add_argument("--virac-dec", default=None,
                     help="Dec column name IN THE VIRAC2 TABLE (default: "
                          "auto-detect from TAP_SCHEMA)")
+    ap.add_argument("--parts-dir", default=None,
+                    help="chunk-cache dir for resumable runs "
+                         "(default: <parquet_out>.parts)")
+    ap.add_argument("--time-budget", type=float, default=None, metavar="SEC",
+                    help="stop cleanly after this many seconds and write the "
+                         "partial output (a re-run resumes from the parts "
+                         "cache). Set below the PBS walltime so the job exits "
+                         "gracefully instead of being killed mid-write.")
     ap.add_argument("--discover", action="store_true",
                     help="list VIRAC2 tables/columns in the TAP schema and exit")
     args = ap.parse_args()
@@ -208,13 +221,47 @@ def main():
           f"querying those only.")
     work = work[in_box].reset_index(drop=True)
 
+    # ---- resumable chunk cache: a killed run (copyq walltime) restarts free --
+    # Every finished chunk lands in <out>.parts/ atomically; on re-run with the
+    # SAME settings those chunks are loaded instead of re-queried. The manifest
+    # guards against silently mixing parts from different inputs/settings.
+    parts_dir = Path(args.parts_dir or (args.parquet_out + ".parts"))
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {"parquet_in": os.path.abspath(args.parquet_in),
+                "n_work": int(len(work)), "chunk": CHUNK,
+                "radius": args.radius, "table": VIRAC2_TABLE, "head": args.head}
+    mpath = parts_dir / "manifest.json"
+    if mpath.exists():
+        old = json.loads(mpath.read_text())
+        if old != manifest:
+            sys.exit(f"{parts_dir} holds chunks from a DIFFERENT run\n"
+                     f"  there: {old}\n  here:  {manifest}\n"
+                     f"delete the dir (or pass --parts-dir) to start fresh")
+        print(f"resuming: reusing finished chunks from {parts_dir}")
+    else:
+        mpath.write_text(json.dumps(manifest))
+
     # A failed chunk (TAP timeout, 5xx, dropped connection) is retried, then
     # SKIPPED — its stars come out unmatched (NaN) instead of killing the run,
     # and are written to <out>.failed.parquet for a targeted re-run.
     results, failed = [], []
     n_chunks = (len(work) + CHUNK - 1) // CHUNK
+    n_cached = 0
+    incomplete = False
+    t_loop = time.time()
     for i in range(0, len(work), CHUNK):
         chunk = work.iloc[i:i + CHUNK]
+        part = parts_dir / f"chunk_{i:08d}.parquet"
+        if part.exists():
+            results.append(pd.read_parquet(part))
+            n_cached += 1
+            continue
+        if args.time_budget and (time.time() - t_loop) > args.time_budget:
+            n_left = n_chunks - i // CHUNK
+            print(f"time budget ({args.time_budget:.0f}s) reached with {n_left} "
+                  f"chunk(s) to go — stopping cleanly; re-run to resume")
+            incomplete = True
+            break
         tag = f"chunk {i // CHUNK + 1}/{n_chunks}"
         for attempt in range(1, args.retries + 1):
             t0 = time.time()
@@ -226,14 +273,19 @@ def main():
                       f"({type(e).__name__}: {e}); retrying in {wait}s")
                 time.sleep(wait)
                 continue
-            print(f"{tag}: {len(chunk)} uploaded, {len(res)} matches, "
-                  f"{time.time() - t0:.0f}s")
+            print(f"{tag}: {len(chunk)} queried, {len(res)} matches, "
+                  f"{time.time() - t0:.0f}s", flush=True)
+            tmp = part.with_suffix(".tmp")          # atomic: no torn parts on kill
+            res.to_parquet(tmp, index=False)
+            os.replace(tmp, part)
             results.append(res)
             break
         else:
             print(f"{tag}: GIVING UP after {args.retries} attempts — "
                   f"{len(chunk)} stars carried through unmatched")
             failed.append(chunk)
+    if n_cached:
+        print(f"{n_cached}/{n_chunks} chunks were already done (cached)")
 
     if not results:
         sys.exit("every chunk failed — is the TAP service down? "
@@ -258,13 +310,27 @@ def main():
         # sidecar with the ORIGINAL column names, so it feeds straight back in:
         #   python vvv.py <out>.failed.parquet retry.parquet --id-col ... ;
         # then combine:  out.fillna(retry)  or concat matched rows by id.
+        # The parts dir is KEPT: a plain re-run retries exactly these chunks.
         fdf = pd.concat(failed, ignore_index=True).rename(columns={
             "_uid": args.id_col, "_ra": args.ra_col, "_dec": args.dec_col})
         fpath = args.parquet_out + ".failed.parquet"
         fdf.to_parquet(fpath, index=False)
         print(f"WARNING: {len(fdf)} stars in {len(failed)} failed chunk(s) were "
               f"never queried (unmatched in the output, NOT confirmed absent) "
-              f"-> re-run them from {fpath}")
+              f"-> re-run the same command to retry them (parts cache kept), "
+              f"or re-run from {fpath}")
+    elif incomplete:
+        print(f"partial output written (unqueried stars = NaN rows); "
+              f"parts cache kept in {parts_dir} — re-run to continue")
+    else:
+        for p in parts_dir.glob("chunk_*.parquet"):
+            p.unlink()
+        mpath.unlink(missing_ok=True)
+        try:
+            parts_dir.rmdir()
+        except OSError:
+            pass
+        print("all chunks succeeded — parts cache removed")
 
 
 if __name__ == "__main__":

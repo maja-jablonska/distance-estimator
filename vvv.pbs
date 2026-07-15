@@ -1,0 +1,79 @@
+#!/bin/bash
+#PBS -N vvv_xmatch
+#PBS -P mk27
+#PBS -q copyq
+#PBS -l ncpus=1
+#PBS -l mem=8GB
+#PBS -l walltime=10:00:00
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
+#PBS -l wd
+#PBS -j oe
+#PBS -m abe
+#PBS -M maja.jablonska@anu.edu.au
+
+# --------------------------------------------------------------------------
+# VIRAC2 crossmatch (vvv.py) for a full target parquet.
+#
+# copyq: the ONLY Gadi queue with outbound internet (the ESO TAP service).
+# Throughput is ~20 stars/query at 1-4 s/query => ~15-25k stars/hour, so a
+# large sample will NOT finish inside one 10 h copyq walltime. That is fine:
+# vvv.py caches every finished chunk in <OUT>.parts/ and a re-run with the
+# same settings resumes where it stopped. Resubmit until the log says
+# "all chunks succeeded — parts cache removed", or let the job requeue
+# itself with -v RESUBMIT=N (it stops resubmitting when done or after N
+# rounds, whichever comes first).
+#
+# Submit:
+#   qsub vvv.pbs
+#   qsub -v PARQUET_IN=/path/bulge_5.parquet,OUT=/scratch/mk27/$USER/virac2.parquet vvv.pbs
+#   qsub -v RESUBMIT=6 vvv.pbs          # keep requeueing up to 6 more times
+#   qsub -v HEAD=100 vvv.pbs            # quick test on the first 100 rows
+#
+# Output: OUT = slim crossmatch table keyed by ID_COL (one row per target,
+# VIRAC2 columns NaN where unmatched) — the spphot --aux-phot format.
+# Failed chunks (if any) land in <OUT>.failed.parquet and are retried on the
+# next submission automatically (their cache entries are missing).
+# --------------------------------------------------------------------------
+
+set -euo pipefail
+
+export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}"
+
+SRC="${SRC:-/scratch/mk27/mj8805}"
+DATA="${DATA:-${SRC}/bulge-ages-and-orbits/data}"
+
+PARQUET_IN="${PARQUET_IN:-${DATA}/bulge_5.parquet}"
+OUT="${OUT:-/scratch/mk27/${USER}/virac2_xmatch.parquet}"
+TABLE="${TABLE:-VVVX_VIRAC_V2_SOURCES}"
+ID_COL="${ID_COL:-sdss_id}"
+RA_COL="${RA_COL:-ra}"
+DEC_COL="${DEC_COL:-dec}"
+RADIUS="${RADIUS:-0.3}"
+EXTRA="${EXTRA:-}"                       # e.g. EXTRA="--virac-dec de"
+HEAD="${HEAD:-}"                         # test mode: first N rows only
+# stop vvv.py cleanly 30 min before the 10 h walltime, so this script survives
+# to resubmit (a walltime kill would take the shell down with it)
+TIME_BUDGET="${TIME_BUDGET:-34200}"
+
+[[ -n "${HEAD}" ]] && EXTRA="${EXTRA} --head ${HEAD}"
+
+echo "== vvv crossmatch: ${PARQUET_IN} -> ${OUT} (table ${TABLE}) =="
+"${PYTHON_BIN}" vvv.py "${PARQUET_IN}" "${OUT}" \
+    --id-col "${ID_COL}" --ra-col "${RA_COL}" --dec-col "${DEC_COL}" \
+    --radius "${RADIUS}" --table "${TABLE}" \
+    --time-budget "${TIME_BUDGET}" ${EXTRA}
+
+# ---- optional self-resubmission until complete -----------------------------
+# vvv.py removes <OUT>.parts/ only when EVERY chunk succeeded, so a surviving
+# parts dir means there is still work (walltime cut the loop short, or some
+# chunks failed all their retries).
+if [[ -d "${OUT}.parts" ]]; then
+    if [[ "${RESUBMIT:-0}" -gt 0 ]]; then
+        echo "incomplete -> resubmitting (RESUBMIT=$((RESUBMIT - 1)) left)"
+        # NOTE: $0 under PBS is the spool copy — resubmit the repo copy instead
+        qsub -v "PARQUET_IN=${PARQUET_IN},OUT=${OUT},TABLE=${TABLE},ID_COL=${ID_COL},RA_COL=${RA_COL},DEC_COL=${DEC_COL},RADIUS=${RADIUS},EXTRA=${EXTRA},TIME_BUDGET=${TIME_BUDGET},RESUBMIT=$((RESUBMIT - 1))" \
+            "${PBS_O_WORKDIR:-.}/vvv.pbs"
+    else
+        echo "incomplete -> resubmit this job to continue (parts cache kept)"
+    fi
+fi
