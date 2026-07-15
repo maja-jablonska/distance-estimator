@@ -1,0 +1,51 @@
+#!/bin/bash
+#PBS -N hogg18_spectra
+#PBS -P mk27
+#PBS -q copyq
+#PBS -l ncpus=1
+#PBS -l mem=16GB
+#PBS -l walltime=10:00:00
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
+#PBS -l wd
+#PBS -j oe
+#PBS -m abe
+#PBS -M maja.jablonska@anu.edu.au
+
+# --------------------------------------------------------------------------
+# Assemble the Hogg+18 (Paper I) original DR14 dataset — assemble_hogg18.py
+#
+# copyq: the ONLY Gadi queue with outbound internet (SDSS SAS + Gaia archive
+# + CDS XMatch). Downloads 44784 aspcapStar files (~10 GB traffic, nothing
+# raw kept), normalizes them (Eilers' procedure) and writes:
+#     ${OUT}/hogg18_allstar.fits      (metadata, table in HDU 2)
+#     ${OUT}/hogg18_spectra.parquet   (flux/continuum/ivar, ~3-5 GB)
+#
+# Every stage is idempotent and the spectra download caches finished
+# 512-star chunks in ${OUT}/spectra_chunks/ — if walltime kills the job,
+# resubmit and it resumes where it stopped. mem=16GB covers the concat
+# stage's 20000-row row-group buffer.
+#
+# The meta stage (allStar download + Gaia/XMatch queries) runs only if its
+# outputs are missing; it needs astroquery in the python env. If astroquery
+# is not installed on Gadi, run the meta stage on a laptop and scp the two
+# small files first:
+#   scp data/hogg18/hogg18_meta.parquet data/hogg18/hogg18_allstar.fits \
+#       gadi:/scratch/mk27/$USER/hogg18/
+#
+# Submit:
+#   qsub assemble_hogg18.pbs
+#   qsub -v OUT=/scratch/mk27/mj8805/hogg18 assemble_hogg18.pbs
+#
+# Afterwards (compute queue, no internet needed):
+#   python run_full_gadi.py --dataset dr17 \
+#       --parquet ${OUT}/hogg18_spectra.parquet \
+#       --allstar ${OUT}/hogg18_allstar.fits
+# --------------------------------------------------------------------------
+
+set -euo pipefail
+
+export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}"
+OUT="${OUT:-/scratch/mk27/${USER}/hogg18}"
+
+echo "== hogg18 dataset assembly -> ${OUT} =="
+"${PYTHON_BIN}" assemble_hogg18.py --stage all --out "${OUT}" --workers 16
