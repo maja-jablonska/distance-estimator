@@ -31,10 +31,13 @@ import pyvo
 
 TAP_URL = "https://archive.eso.org/tap_cat"
 VIRAC2_TABLE = None  # set after running --discover, e.g. "VVVX.VIRAC2_sources"
-# ESO tap_cat has TAP_UPLOAD *disabled*, so the crossmatch is an OR-of-circles
-# WHERE clause (one CONTAINS per target) instead of an upload-join. Each circle
-# adds ~110 chars of ADQL, so keep chunks small enough for the query to parse.
-CHUNK = 500
+# ESO tap_cat has TAP_UPLOAD *disabled* and its ADQL->SQL translator is broken
+# for geometric functions (even a single CONTAINS dies with "SQL Anywhere Error
+# -131 near 'between'"). So the crossmatch is an OR-of-small-boxes WHERE clause
+# (plain ra/de range comparisons, index-friendly) + a local exact-radius cut.
+# Measured against the live service (2026-07): <=25 boxes/query run in 1-4s;
+# ~50 boxes tips the query planner into a full scan and times out at ~60s.
+CHUNK = 20
 
 # Columns to pull from VIRAC2. Trim/extend after --discover shows the schema.
 # Keep the quality/crowding bookkeeping — you want it as covariates later.
@@ -82,9 +85,10 @@ def virac_coord_cols(tap, table, ra_override=None, dec_override=None):
 
 
 def xmatch_chunk(tap, chunk_df, radius_arcsec, vra, vdec):
-    """Pull every VIRAC2 source within `radius_arcsec` of ANY target in the
-    chunk (no upload — ESO tap_cat forbids TAP_UPLOAD), then assign each
-    returned source to its nearest target locally and cut to the radius.
+    """Pull every VIRAC2 source inside a small ra/de box around ANY target in
+    the chunk (no upload, no ADQL geometry — see the CHUNK comment), then
+    assign each returned source to its nearest target locally and cut to the
+    exact radius (the box is a superset of the circle).
 
     A source sitting within the radius of two different targets is assigned
     only to the nearer one — impossible in practice at r ~ 0.3" unless two
@@ -94,11 +98,17 @@ def xmatch_chunk(tap, chunk_df, radius_arcsec, vra, vdec):
 
     r_deg = radius_arcsec / 3600.0
     # double quotes = ADQL delimited identifiers (exact-case, reserved-word-safe)
-    circles = " OR ".join(
-        f"1=CONTAINS(POINT('ICRS', v.\"{vra}\", v.\"{vdec}\"), "
-        f"CIRCLE('ICRS', {ra:.8f}, {dec:.8f}, {r_deg:.8f}))"
-        for ra, dec in zip(chunk_df["_ra"], chunk_df["_dec"]))
-    adql = f"SELECT {VIRAC2_COLS} FROM {VIRAC2_TABLE} AS v WHERE {circles}"
+    terms = []
+    for ra, dec in zip(chunk_df["_ra"], chunk_df["_dec"]):
+        dra = r_deg / max(np.cos(np.radians(dec)), 1e-6)
+        lo, hi = ra - dra, ra + dra
+        if lo < 0 or hi > 360:                     # RA wrap (not hit in the bulge)
+            ra_cond = (f'(v."{vra}">={lo % 360:.8f} OR v."{vra}"<={hi % 360:.8f})')
+        else:
+            ra_cond = f'v."{vra}">={lo:.8f} AND v."{vra}"<={hi:.8f}'
+        terms.append(f'({ra_cond} AND v."{vdec}">={dec - r_deg:.8f} '
+                     f'AND v."{vdec}"<={dec + r_deg:.8f})')
+    adql = f"SELECT {VIRAC2_COLS} FROM {VIRAC2_TABLE} AS v WHERE " + " OR ".join(terms)
     res = tap.run_sync(adql).to_table().to_pandas()
     if res.empty:
         return res.assign(_uid=pd.Series(dtype=str),
