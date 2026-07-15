@@ -161,55 +161,71 @@ def stage_meta():
     # (2) ESA archive numeric-IN on tmass_best_neighbour to keep exactly the
     #     archive's official 2MASS assignment (what the paper used),
     # (3) ESA archive numeric-IN join for photometry/astrometry/AllWISE.
-    log("CDS XMatch: 2MASS positions -> Gaia DR2 candidates ...")
     from astroquery.gaia import Gaia
-    from astroquery.xmatch import XMatch
     import astropy.units as u
     Gaia.ROW_LIMIT = -1
 
-    pos = zc[["sdss_id"]].merge(allstar[["sdss_id", "ra", "dec"]],
-                                on="sdss_id", how="left")
-    cand = []
-    for radius in (2.0, 5.0):                    # widen only for the stragglers
-        todo = pos if radius == 2.0 else pos[~pos["sdss_id"].isin(
-            {c for t in cand for c in t["sdss_id"]})]
-        if not len(todo):
-            break
-        xm = XMatch.query(cat1=Table.from_pandas(todo),
-                          cat2="vizier:I/345/gaia2",
-                          max_distance=radius * u.arcsec,
-                          colRA1="ra", colDec1="dec").to_pandas()
-        cand.append(xm[["sdss_id", "source_id"]])
-        log(f"  XMatch r={radius}\": {len(xm)} candidate pairs")
-    cand = pd.concat(cand, ignore_index=True).drop_duplicates()
-    cand["source_id"] = cand["source_id"].astype(np.int64)
-
-    def esa_numeric_in(template, ids, step=1500, tag=""):
-        # step < 2000 so the anonymous sync-row cap can never truncate a chunk
+    def esa_numeric_in(template, ids, step=500, tag=""):
+        # step < 2000 so the anonymous sync-row cap can never truncate a chunk.
+        # Each chunk is cached to disk: the archive drops connections at random
+        # (evening flakiness / rate limiting), and reruns must cost nothing.
+        # step is part of the cache key — a different step must never reuse files.
+        cache_dir = os.path.join(OUT, "esa_cache")
+        os.makedirs(cache_dir, exist_ok=True)
         parts = []
         n_chunks = (len(ids) + step - 1) // step
         for i in range(0, len(ids), step):
+            cpath = os.path.join(cache_dir, f"{tag}_s{step}_{i//step:04d}.parquet")
+            if os.path.exists(cpath):
+                parts.append(pd.read_parquet(cpath))
+                continue
             inlist = ",".join(map(str, ids[i:i + step]))
-            for attempt in range(4):
+            for attempt in range(7):
                 try:
                     job = Gaia.launch_job(template.format(inlist=inlist))
-                    parts.append(job.get_results().to_pandas())
+                    chunk = job.get_results().to_pandas()
+                    chunk.columns = [c.lower() for c in chunk.columns]
+                    for c in chunk.columns:      # bytes -> str for parquet
+                        if chunk[c].dtype == object:
+                            chunk[c] = chunk[c].apply(
+                                lambda s: s.decode() if isinstance(s, bytes) else s)
+                    chunk.to_parquet(cpath, index=False)
+                    parts.append(chunk)
                     break
                 except Exception as e:
-                    if attempt == 3:
+                    if attempt == 6:
                         raise
-                    log(f"  {tag} chunk {i//step}: {type(e).__name__}, retrying ...")
-                    time.sleep(10 * (attempt + 1))
+                    wait = 15 * 2 ** attempt      # 15s .. 16 min
+                    log(f"  {tag} chunk {i//step}: {type(e).__name__}, "
+                        f"retry in {wait}s ...")
+                    time.sleep(wait)
             log(f"  {tag} chunk {i//step + 1}/{n_chunks}: {len(parts[-1])} rows")
-        out = pd.concat(parts, ignore_index=True)
-        out.columns = [c.lower() for c in out.columns]
-        return out
+        return pd.concat(parts, ignore_index=True)
 
     match_cache = os.path.join(OUT, "gaia_match_cache.parquet")
     if os.path.exists(match_cache):
         good = pd.read_parquet(match_cache)
         log(f"Gaia: loaded {len(good)} archive-confirmed matches from cache")
     else:
+        log("CDS XMatch: 2MASS positions -> Gaia DR2 candidates ...")
+        from astroquery.xmatch import XMatch
+        pos = zc[["sdss_id"]].merge(allstar[["sdss_id", "ra", "dec"]],
+                                    on="sdss_id", how="left")
+        cand = []
+        for radius in (2.0, 5.0):                # widen only for the stragglers
+            todo = pos if radius == 2.0 else pos[~pos["sdss_id"].isin(
+                {c for t in cand for c in t["sdss_id"]})]
+            if not len(todo):
+                break
+            xm = XMatch.query(cat1=Table.from_pandas(todo),
+                              cat2="vizier:I/345/gaia2",
+                              max_distance=radius * u.arcsec,
+                              colRA1="ra", colDec1="dec").to_pandas()
+            cand.append(xm[["sdss_id", "source_id"]])
+            log(f"  XMatch r={radius}\": {len(xm)} candidate pairs")
+        cand = pd.concat(cand, ignore_index=True).drop_duplicates()
+        cand["source_id"] = cand["source_id"].astype(np.int64)
+
         log("ESA archive: official tmass_best_neighbour assignment ...")
         sids = np.unique(cand["source_id"].to_numpy())
         arch = esa_numeric_in(
@@ -231,7 +247,14 @@ def stage_meta():
         good.to_parquet(match_cache, index=False)
 
     # the triple join gaia_source x allwise_best_neighbour x allwise_original_valid
-    # exceeds the sync timeout even on indexed numeric INs -> three flat queries
+    # exceeds the sync timeout even on indexed numeric INs -> three flat queries,
+    # cached so a crash after the ~45-min query pass costs nothing to rerun
+    phot_cache = os.path.join(OUT, "gaia_phot_cache.parquet")
+    if os.path.exists(phot_cache):
+        gtab = pd.read_parquet(phot_cache)
+        log(f"Gaia: loaded photometry for {len(gtab)} stars from cache")
+        return _write_meta(zc, allstar, gtab)
+
     log("ESA archive: gaia_source photometry + astrometry ...")
     sids = good["source_id"].to_numpy()
     gphot = esa_numeric_in(
@@ -262,9 +285,16 @@ def stage_meta():
                 .merge(wphot, on="allwise_oid", how="left")
                 .drop(columns=["allwise_oid"]))
     log(f"Gaia: {len(gtab)} rows, {int(gtab['w2_mag'].notna().sum())} with WISE")
+    gtab.to_parquet(phot_cache, index=False)
+    _write_meta(zc, allstar, gtab)
+
+
+def _write_meta(zc, allstar, gtab):
+    import pandas as pd
+    from astropy.table import Table
 
     meta = zc.merge(allstar, on="sdss_id", how="left").merge(
-        gtab.drop(columns=["tmass"]), on="sdss_id", how="left")
+        gtab, on="sdss_id", how="left")
     assert len(meta) == 44784
     meta["zeropoint"] = ZEROPOINT
     meta["spectrum_flags"] = 0
