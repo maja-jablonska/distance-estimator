@@ -205,42 +205,63 @@ def stage_meta():
         out.columns = [c.lower() for c in out.columns]
         return out
 
-    log("ESA archive: official tmass_best_neighbour assignment ...")
-    sids = np.unique(cand["source_id"].to_numpy())
-    arch = esa_numeric_in(
-        "SELECT xm.source_id, xm.original_ext_source_id AS tmass, "
-        "xm.angular_distance AS tmass_dist "
-        "FROM gaiadr2.tmass_best_neighbour xm WHERE xm.source_id IN ({inlist})",
-        sids, tag="tmass")
-    arch["tmass"] = arch["tmass"].apply(
-        lambda s: s.decode() if isinstance(s, bytes) else s)
-    arch["sdss_id"] = "2M" + arch["tmass"].astype(str)
-    # keep only candidates whose archive 2MASS assignment IS our star
-    good = cand.merge(arch.drop(columns=["tmass"]), on=["sdss_id", "source_id"])
-    # a 2MASS source can be best neighbour of >1 Gaia source: keep the closest
-    n_multi = int(good["sdss_id"].duplicated().sum())
-    good = (good.sort_values("tmass_dist", kind="stable")
-                .drop_duplicates("sdss_id", keep="first"))
-    log(f"Gaia: {len(good)}/44784 archive-confirmed matches "
-        f"({n_multi} multi-match resolved by distance)")
+    match_cache = os.path.join(OUT, "gaia_match_cache.parquet")
+    if os.path.exists(match_cache):
+        good = pd.read_parquet(match_cache)
+        log(f"Gaia: loaded {len(good)} archive-confirmed matches from cache")
+    else:
+        log("ESA archive: official tmass_best_neighbour assignment ...")
+        sids = np.unique(cand["source_id"].to_numpy())
+        arch = esa_numeric_in(
+            "SELECT xm.source_id, xm.original_ext_source_id AS tmass, "
+            "xm.angular_distance AS tmass_dist "
+            "FROM gaiadr2.tmass_best_neighbour xm WHERE xm.source_id IN ({inlist})",
+            sids, tag="tmass")
+        arch["tmass"] = arch["tmass"].apply(
+            lambda s: s.decode() if isinstance(s, bytes) else s)
+        arch["sdss_id"] = "2M" + arch["tmass"].astype(str)
+        # keep only candidates whose archive 2MASS assignment IS our star
+        good = cand.merge(arch.drop(columns=["tmass"]), on=["sdss_id", "source_id"])
+        # a 2MASS source can be best neighbour of >1 Gaia source: keep the closest
+        n_multi = int(good["sdss_id"].duplicated().sum())
+        good = (good.sort_values("tmass_dist", kind="stable")
+                    .drop_duplicates("sdss_id", keep="first"))
+        log(f"Gaia: {len(good)}/44784 archive-confirmed matches "
+            f"({n_multi} multi-match resolved by distance)")
+        good.to_parquet(match_cache, index=False)
 
-    log("ESA archive: photometry + astrometry + AllWISE ...")
-    gtab = esa_numeric_in(
+    # the triple join gaia_source x allwise_best_neighbour x allwise_original_valid
+    # exceeds the sync timeout even on indexed numeric INs -> three flat queries
+    log("ESA archive: gaia_source photometry + astrometry ...")
+    sids = good["source_id"].to_numpy()
+    gphot = esa_numeric_in(
         "SELECT g.source_id, g.phot_g_mean_mag AS g_mag, "
         "g.phot_bp_mean_mag AS bp_mag, g.phot_rp_mean_mag AS rp_mag, "
         "g.parallax AS plx, g.parallax_error AS e_plx, "
         "g.visibility_periods_used, g.astrometric_chi2_al, "
-        "g.astrometric_n_good_obs_al, g.phot_variable_flag, "
-        "w.w1mpro AS w1_mag, w.w2mpro AS w2_mag "
-        "FROM gaiadr2.gaia_source g "
-        "LEFT JOIN gaiadr2.allwise_best_neighbour wx ON wx.source_id = g.source_id "
-        "LEFT JOIN gaiadr1.allwise_original_valid w ON w.allwise_oid = wx.allwise_oid "
-        "WHERE g.source_id IN ({inlist})",
-        good["source_id"].to_numpy(), tag="phot")
-    gtab["phot_variable_flag"] = gtab["phot_variable_flag"].apply(
+        "g.astrometric_n_good_obs_al, g.phot_variable_flag "
+        "FROM gaiadr2.gaia_source g WHERE g.source_id IN ({inlist})",
+        sids, tag="gaia")
+    gphot["phot_variable_flag"] = gphot["phot_variable_flag"].apply(
         lambda s: s.decode() if isinstance(s, bytes) else s)
-    gtab = good.merge(gtab, on="source_id", how="left")
-    log(f"Gaia: {len(gtab)} rows with photometry")
+
+    log("ESA archive: allwise_best_neighbour ...")
+    wx = esa_numeric_in(
+        "SELECT xm.source_id, xm.allwise_oid "
+        "FROM gaiadr2.allwise_best_neighbour xm WHERE xm.source_id IN ({inlist})",
+        sids, tag="wise-x")
+
+    log("ESA archive: AllWISE photometry ...")
+    wphot = esa_numeric_in(
+        "SELECT w.allwise_oid, w.w1mpro AS w1_mag, w.w2mpro AS w2_mag "
+        "FROM gaiadr1.allwise_original_valid w WHERE w.allwise_oid IN ({inlist})",
+        np.unique(wx["allwise_oid"].to_numpy()), tag="wise")
+
+    gtab = (good.merge(gphot, on="source_id", how="left")
+                .merge(wx, on="source_id", how="left")
+                .merge(wphot, on="allwise_oid", how="left")
+                .drop(columns=["allwise_oid"]))
+    log(f"Gaia: {len(gtab)} rows, {int(gtab['w2_mag'].notna().sum())} with WISE")
 
     meta = zc.merge(allstar, on="sdss_id", how="left").merge(
         gtab.drop(columns=["tmass"]), on="sdss_id", how="left")
