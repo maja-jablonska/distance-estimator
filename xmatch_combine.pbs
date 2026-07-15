@@ -1,0 +1,51 @@
+#!/bin/bash
+#PBS -N xmatch_combine
+#PBS -P mk27
+#PBS -q normal
+#PBS -l ncpus=1
+#PBS -l mem=64GB
+#PBS -l walltime=01:00:00
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
+#PBS -l wd
+#PBS -j oe
+#PBS -m abe
+#PBS -M maja.jablonska@anu.edu.au
+
+# --------------------------------------------------------------------------
+# Combine the VVV/VIRAC2 (vvv.py) and GLIMPSE (glimpse.py) crossmatch outputs
+# with the original APOGEE parquet (xmatch_combine.py) into one master table.
+#
+# Pure local pandas joins — no internet needed, so any compute queue works;
+# it just wants memory for the scalar columns of the APOGEE parquet. Runs in
+# minutes; bump MEM if the job is OOM-killed.
+#
+# Submit:
+#   qsub xmatch_combine.pbs
+#   qsub -v APOGEE_IN=/path/other.parquet,OUT=/scratch/mk27/$USER/comb.parquet xmatch_combine.pbs
+#   qsub -v REQUIRE=any xmatch_combine.pbs   # keep only matched targets
+#
+# Output: OUT = one row per APOGEE target, aux columns NaN where unmatched,
+# in_vvv / in_glimpse flags — keyed by ID_COL (spphot --aux-phot friendly).
+# --------------------------------------------------------------------------
+
+set -euo pipefail
+
+export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}"
+
+SRC="${SRC:-/scratch/mk27/mj8805}"
+
+APOGEE_IN="${APOGEE_IN:-${SRC}/bulge-ages-and-orbits/data/astra_photogeo.parquet}"
+VVV_IN="${VVV_IN:-${SRC}/virac2_xmatch.parquet}"
+GLIMPSE_IN="${GLIMPSE_IN:-${SRC}/distance-estimator/test_glimpse.parquet}"
+OUT="${OUT:-/scratch/mk27/${USER}/combined_xmatch.parquet}"
+ID_COL="${ID_COL:-sdss_id}"
+RA_COL="${RA_COL:-ra}"
+DEC_COL="${DEC_COL:-dec}"
+REQUIRE="${REQUIRE:-none}"               # none | any | both
+EXTRA="${EXTRA:-}"                       # e.g. EXTRA="--apogee-cols sdss_id ra dec teff"
+
+echo "== combine: ${APOGEE_IN} + ${VVV_IN} + ${GLIMPSE_IN} -> ${OUT} =="
+"${PYTHON_BIN}" xmatch_combine.py \
+    "${APOGEE_IN}" "${VVV_IN}" "${GLIMPSE_IN}" "${OUT}" \
+    --id-col "${ID_COL}" --ra-col "${RA_COL}" --dec-col "${DEC_COL}" \
+    --require "${REQUIRE}" ${EXTRA}
