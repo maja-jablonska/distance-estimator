@@ -1,0 +1,50 @@
+#!/bin/bash
+#PBS -N hogg18_clusters
+#PBS -P mk27
+#PBS -q copyq
+#PBS -l ncpus=1
+#PBS -l mem=8GB
+#PBS -l walltime=00:30:00
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
+#PBS -l wd
+#PBS -j oe
+#PBS -m abe
+#PBS -M maja.jablonska@anu.edu.au
+
+# --------------------------------------------------------------------------
+# Paper I Fig-4 cluster validation on hogg18 — hogg18_cluster_test.py
+#
+# copyq because the one-time proper-motion fetch (82 stars around M67 / M71 /
+# M107) queries the ESA Gaia archive; once cluster_pm_cache.parquet exists
+# next to the meta parquet the job runs fully offline, so reruns after a new
+# model fit are internet-free anyway. Everything else is seconds of work.
+#
+# Prints two metric tables (the paper's published spec_parallax as reference,
+# then our --results predictions) and writes the Fig-4 style figure.
+#
+# Submit:
+#   qsub hogg18_cluster_test.pbs
+#   # after a refit with a different results file:
+#   qsub -v RESULTS=/scratch/mk27/mj8805/hogg18/spphot_results_hogg18_l1.parquet hogg18_cluster_test.pbs
+# --------------------------------------------------------------------------
+
+set -euo pipefail
+
+export PYTHON_BIN="${PYTHON_BIN:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}"
+DATA="${DATA:-/scratch/mk27/${USER}/hogg18}"
+META="${META:-${DATA}/hogg18_meta.parquet}"
+RESULTS="${RESULTS:-${DATA}/spphot_results_hogg18.parquet}"
+ALLSTAR_RAW="${ALLSTAR_RAW:-${DATA}/allStar-l31c.2.fits}"
+FIG="${FIG:-${DATA}/hogg18_clusters.png}"
+
+echo "[pbs] meta=${META}"
+echo "[pbs] results=${RESULTS}"
+echo "[pbs] allstar_raw=${ALLSTAR_RAW} fig=${FIG}"
+
+"${PYTHON_BIN}" hogg18_cluster_test.py \
+    --meta "${META}" \
+    --results "${RESULTS}" \
+    --allstar-raw "${ALLSTAR_RAW}" \
+    --fig "${FIG}"
+
+echo "[pbs] done -> ${FIG}"
