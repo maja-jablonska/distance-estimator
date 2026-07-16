@@ -1,4 +1,5 @@
 # generated data / intermediate products
+data/
 spphot_data/
 *.npz
 xmatch.fits
