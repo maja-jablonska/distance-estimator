@@ -37,7 +37,13 @@ def main():
     ap.add_argument("--out", default="results_full.parquet")
     ap.add_argument("--model-out", default=None,
                     help="path for the saved model npz (default: <out>_model.npz)")
-    ap.add_argument("--lam", type=float, default=0.1, help="ridge strength")
+    ap.add_argument("--lam", type=float, default=0.1, help="regularization strength")
+    ap.add_argument("--penalty", default="l2", choices=("l2", "l1"),
+                    help="what --lam controls: 'l2' = ridge on all coefficients; "
+                         "'l1' = Paper I's sparsity prior on the SPECTRAL "
+                         "coefficients only (intercept + photometry unpenalized). "
+                         "The two lams live on different scales — rescan when "
+                         "switching penalty")
     ap.add_argument("--lam-scan", default=None,
                     help="comma-separated ridge values to scan, e.g. '0.003,0.01,0.03,0.1,0.3'; "
                          "picks the lam with the lowest cross-validated fold scatter, then "
@@ -87,13 +93,18 @@ def main():
     phot_tr, spec_tr = phot_k[train_k], X_spec[train_k]
     plx_tr, err_tr, fold_tr = plx_k[train_k], err_k[train_k], samp_k[train_k]
 
+    n_free = 1 + S["n_phot"]                  # intercept + photometry: L1-exempt
+
     def fit_on(mask, name, lam):
         Xf, st = design(phot_tr[mask], spec_tr[mask])
         th, res = fit_parallax_model(Xf, plx_tr[mask], err_tr[mask], lam=lam,
-                                     clip_sigma=args.clip_sigma)
+                                     clip_sigma=args.clip_sigma,
+                                     penalty=args.penalty, n_free=n_free)
         clip_msg = f" clipped={res.n_clipped}/{mask.sum()}" if args.clip_sigma > 0 else ""
-        log(f"  fit {name}: {mask.sum()} stars | lam={lam:g} converged={res.success} "
-            f"iters={res.nit} obj={res.fun:.4f}{clip_msg}")
+        nnz_msg = (f" nnz={res.nnz}/{spec_tr.shape[1]}" if hasattr(res, "nnz") else "")
+        log(f"  fit {name}: {mask.sum()} stars | {args.penalty} lam={lam:g} "
+            f"converged={res.success} iters={res.nit} obj={res.fun:.4f}"
+            f"{nnz_msg}{clip_msg}")
         return th, st
 
     # ---- optional ridge scan: choose lam by cross-validated fold scatter ----
@@ -101,12 +112,13 @@ def main():
     if args.lam_scan:
         import re
         lams = [float(x) for x in re.split(r"[,;\s]+", args.lam_scan.strip()) if x]
-        log(f"lambda scan over {lams} "
+        log(f"lambda scan over {lams} [{args.penalty}] "
             f"(cross-validated robust fractional scatter on the hi-S/N probe) ...")
         scan = {}
         for lam in lams:
             sc, fa, fb = cv_fold_scatter(phot_tr, spec_tr, plx_tr, err_tr, fold_tr, lam,
-                                         clip_sigma=args.clip_sigma)
+                                         clip_sigma=args.clip_sigma,
+                                         penalty=args.penalty, n_free=n_free)
             scan[lam] = (sc, fa, fb)
             log(f"  lam={lam:<8g} CV fold scatter = {100*sc:.2f}%")
         best_lam = min(scan, key=lambda L: scan[L][0])
@@ -165,9 +177,9 @@ def main():
                theta_A=theta_A, stats_A=stats_A, theta_B=theta_B, stats_B=stats_B,
                good=good, frac_sigma=frac_sigma, tel_masks=tel_masks,
                dataset=spec_ds,
-               config={"lam": args.lam, "f_max": 2.0, "bad_frac": args.bad_frac,
-                       "snr_min": args.snr_min, "clip_sigma": args.clip_sigma,
-                       "seed": args.seed})
+               config={"lam": args.lam, "penalty": args.penalty, "f_max": 2.0,
+                       "bad_frac": args.bad_frac, "snr_min": args.snr_min,
+                       "clip_sigma": args.clip_sigma, "seed": args.seed})
     log(f"wrote {args.out}  ({len(out)} stars)")
     log(f"saved model -> {model_out}")
 

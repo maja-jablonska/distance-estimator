@@ -119,9 +119,99 @@ def _gn_fit(X, plx, sigma, lam, maxiter=100, gtol=1e-7, ftol=1e-12, theta0=None)
     return theta, res
 
 
+def _l1_fit(X, plx, sigma, lam, n_free, theta0=None, maxiter=3000, gtol=1e-7):
+    """theta for plx ~ exp(X @ theta): Gaussian-in-parallax NLL + L1 on the
+    penalized block only — Paper I eq. (3), where the P operator restricts the
+    regularization to the spectral coefficients (columns >= n_free; the intercept
+    and photometry stay unpenalized).
+
+    Split formulation theta_pen = p - q with p, q >= 0 turns the non-smooth L1
+    term into the smooth lam * sum(p + q) under box constraints, handled by
+    L-BFGS-B (the paper optimized its objective with the same algorithm).
+
+    Objective F = 0.5/N * sum((plx-m)^2/sigma^2) + lam * sum|theta_pen|.
+    Returns (theta, res) with res.x .success .nit .fun .jac plus res.nnz, the
+    count of surviving (nonzero) penalized coefficients — Paper I's L1 zeroed
+    ~75% of theirs.
+    """
+    from types import SimpleNamespace
+    from scipy.optimize import minimize
+    X = np.asarray(X, float); plx = np.asarray(plx, float); sigma = np.asarray(sigma, float)
+    N, D = X.shape
+    L = D - n_free
+    invN = 1.0 / N
+    inv_s2 = 1.0 / sigma ** 2
+
+    if theta0 is None:
+        # log-space ridge solve on positive parallaxes, as in _gn_fit's warm
+        # start (the fixed unit reg is only an initializer)
+        pos = plx > 0
+        Xw, yw = X[pos], np.log(plx[pos])
+        reg = np.ones(D); reg[0] = 0.0
+        try:
+            theta0 = np.linalg.solve(Xw.T @ Xw + np.diag(reg) * pos.sum(), Xw.T @ yw)
+        except np.linalg.LinAlgError:
+            theta0 = np.zeros(D); theta0[0] = np.log(np.median(plx[pos]))
+
+    def fg(z):
+        theta = np.empty(D)
+        theta[:n_free] = z[:n_free]
+        theta[n_free:] = z[n_free:n_free + L] - z[n_free + L:]
+        m = np.exp(np.clip(X @ theta, -30.0, 30.0))
+        r = (plx - m) / sigma
+        f = 0.5 * invN * float(r @ r) + lam * float(np.sum(z[n_free:]))
+        g = invN * (X.T @ (m * (m - plx) * inv_s2))
+        gz = np.empty(z.size)
+        gz[:n_free] = g[:n_free]
+        gz[n_free:n_free + L] = g[n_free:] + lam
+        gz[n_free + L:] = -g[n_free:] + lam
+        return f, gz
+
+    z0 = np.concatenate([theta0[:n_free],
+                         np.clip(theta0[n_free:], 0.0, None),
+                         np.clip(-theta0[n_free:], 0.0, None)])
+    bounds = [(None, None)] * n_free + [(0.0, None)] * (2 * L)
+    r = minimize(fg, z0, jac=True, method="L-BFGS-B", bounds=bounds,
+                 options={"maxiter": maxiter, "maxfun": 10 * maxiter,
+                          "ftol": 1e-14, "gtol": gtol})
+    theta = np.empty(D)
+    theta[:n_free] = r.x[:n_free]
+    theta[n_free:] = r.x[n_free:n_free + L] - r.x[n_free + L:]
+
+    # L-BFGS-B parks inactive coordinates at ~1e-7 rather than exactly on the
+    # bound; snap them to true zero at the largest threshold that does not
+    # increase the objective (zeroing also sheds its penalty, so this is
+    # almost always accepted)
+    def F(th):
+        m = np.exp(np.clip(X @ th, -30.0, 30.0))
+        rr = (plx - m) / sigma
+        return 0.5 * invN * float(rr @ rr) + lam * float(np.abs(th[n_free:]).sum())
+
+    f_opt = F(theta)
+    for thr in (1e-4, 1e-5, 1e-6, 1e-8):
+        th_try = theta.copy()
+        th_try[n_free:][np.abs(th_try[n_free:]) < thr] = 0.0
+        f_try = F(th_try)
+        if f_try <= f_opt + 1e-12 * max(abs(f_opt), 1.0):
+            theta, f_opt = th_try, f_try
+            break
+
+    res = SimpleNamespace(x=theta, success=bool(r.success), nit=int(r.nit),
+                          fun=f_opt, jac=r.jac,
+                          nnz=int(np.sum(theta[n_free:] != 0.0)))
+    if not r.success:
+        log(f"  WARNING: L1 L-BFGS-B stopped early ({str(r.message)})")
+    return theta, res
+
+
 def fit_parallax_model(X, plx, sigma, lam, maxiter=100, gtol=1e-7, ftol=1e-12,
-                       clip_sigma=0.0, clip_rounds=5):
+                       clip_sigma=0.0, clip_rounds=5, penalty="l2", n_free=1):
     """Fit theta (see _gn_fit) with optional iterative training-set sigma-clipping.
+
+    penalty selects the regularizer that lam controls: "l2" (default) is the
+    ridge Gauss-Newton fit on all non-intercept coefficients; "l1" is Paper I's
+    sparsity prior on the penalized block only (columns >= n_free, i.e. pass
+    n_free = 1 + n_phot so intercept + photometry stay unpenalized).
 
     When clip_sigma > 0: after each GN fit, standardize the parallax residual
     chi = (plx - m)/sigma, drop the stars more than clip_sigma robust deviations
@@ -140,7 +230,13 @@ def fit_parallax_model(X, plx, sigma, lam, maxiter=100, gtol=1e-7, ftol=1e-12,
     X = np.asarray(X, float); plx = np.asarray(plx, float); sigma = np.asarray(sigma, float)
     N = X.shape[0]
     keep = np.ones(N, bool)
-    theta, res = _gn_fit(X, plx, sigma, lam, maxiter, gtol, ftol)
+
+    def fit1(Xs, ps, ss, th0=None):
+        if penalty == "l1":
+            return _l1_fit(Xs, ps, ss, lam, n_free, theta0=th0, gtol=gtol)
+        return _gn_fit(Xs, ps, ss, lam, maxiter, gtol, ftol, theta0=th0)
+
+    theta, res = fit1(X, plx, sigma)
     if clip_sigma and clip_sigma > 0:
         for _ in range(clip_rounds):
             m = np.exp(np.clip(X @ theta, -30.0, 30.0))
@@ -154,9 +250,8 @@ def fit_parallax_model(X, plx, sigma, lam, maxiter=100, gtol=1e-7, ftol=1e-12,
                 break                                  # converged: nothing new clipped
             keep = new_keep
             # warm-start from the current theta: dropping ~1% of stars barely moves
-            # the optimum, so GN re-converges in a couple of iterations
-            theta, res = _gn_fit(X[keep], plx[keep], sigma[keep], lam,
-                                 maxiter, gtol, ftol, theta0=theta)
+            # the optimum, so the refit re-converges in a couple of iterations
+            theta, res = fit1(X[keep], plx[keep], sigma[keep], th0=theta)
     res.n_clipped = int(N - keep.sum())
     res.n_used = int(keep.sum())
     return theta, res
@@ -171,7 +266,8 @@ def predict(theta, stats, phot, spec, batch=50000):
     return out
 
 
-def cv_fold_scatter(phot_tr, spec_tr, plx_tr, err_tr, fold_tr, lam, clip_sigma=0.0):
+def cv_fold_scatter(phot_tr, spec_tr, plx_tr, err_tr, fold_tr, lam, clip_sigma=0.0,
+                    penalty="l2", n_free=1):
     """Fit fold-A and fold-B at this lam, predict each fold with the OTHER fold's
     model, and return the honest cross-validated headline metric:
         (robust fractional scatter on the hi-S/N probe, (thA,stA), (thB,stB)).
@@ -180,9 +276,11 @@ def cv_fold_scatter(phot_tr, spec_tr, plx_tr, err_tr, fold_tr, lam, clip_sigma=0
     reuse the winning lam's fits without refitting them."""
     A, B = fold_tr == "A", fold_tr == "B"
     XA, stA = design(phot_tr[A], spec_tr[A])
-    thA, _ = fit_parallax_model(XA, plx_tr[A], err_tr[A], lam=lam, clip_sigma=clip_sigma)
+    thA, _ = fit_parallax_model(XA, plx_tr[A], err_tr[A], lam=lam, clip_sigma=clip_sigma,
+                                penalty=penalty, n_free=n_free)
     XB, stB = design(phot_tr[B], spec_tr[B])
-    thB, _ = fit_parallax_model(XB, plx_tr[B], err_tr[B], lam=lam, clip_sigma=clip_sigma)
+    thB, _ = fit_parallax_model(XB, plx_tr[B], err_tr[B], lam=lam, clip_sigma=clip_sigma,
+                                penalty=penalty, n_free=n_free)
     plx_sp = np.empty(len(plx_tr))
     plx_sp[A] = predict(thB, stB, phot_tr[A], spec_tr[A])   # A held out from B's fit
     plx_sp[B] = predict(thA, stA, phot_tr[B], spec_tr[B])   # B held out from A's fit
@@ -222,6 +320,7 @@ def save_model(path, *, theta_all, stats_all, theta_A, stats_A, theta_B, stats_B
         lam=np.float64(config["lam"]), f_max=np.float64(config["f_max"]),
         bad_frac=np.float64(config["bad_frac"]), snr_min=np.float64(config["snr_min"]),
         clip_sigma=np.float64(config.get("clip_sigma", 0.0)),
+        penalty=np.array(config.get("penalty", "l2")),
         seed=np.int64(config["seed"]),
         **extra,
     )
@@ -244,6 +343,7 @@ def load_model(path):
         "theta_B": z["theta_B"], "stats_B": (z["mu_B"], z["sd_B"]),
         "good_pixel_mask": z["good_pixel_mask"], "frac_sigma": float(z["frac_sigma"]),
         "f_max": float(z["f_max"]), "bad_frac": float(z["bad_frac"]),
+        "penalty": str(z["penalty"]) if "penalty" in z.files else "l2",
         "label_cols": label_cols,
         "dataset": ds,
         "phot_cols": ([str(c) for c in z["phot_cols"]] if "phot_cols" in z.files

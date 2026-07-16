@@ -35,10 +35,12 @@
 # Eilers-style ivar=0 masks flag a few % of stars at nearly every pixel, so
 # the default 0.01 censors ALL pixels (photometry-only fit); per-star bad
 # pixels are imputed to ln f = 0, so the shared mask only needs to drop
-# never-lit pixels — 0.95 lands near the paper's 7405. Small sample ->
-# small request:
+# never-lit pixels — 0.95 lands near the paper's 7405. PENALTY=l1 is the
+# paper's actual regularizer (L1 on spectral coefficients only; ridge at any
+# lam plateaued ~1.5 points above the paper) — its lam lives on a different
+# scale than the ridge lam, so scan. Small sample -> small request:
 #   qsub -l ncpus=16,mem=64GB,walltime=02:00:00 \
-#        -v PARQUET=/scratch/mk27/mj8805/hogg18/hogg18_spectra.parquet,ALLSTAR=/scratch/mk27/mj8805/hogg18/hogg18_allstar.fits,OUT=/scratch/mk27/mj8805/hogg18/spphot_results_hogg18.parquet,PIXEL_MASK_DIR=,TRAIN_COL=hogg_training_set,SAMPLE_COL=hogg_sample,CLIP_SIGMA=0,BAD_FRAC=0.95 \
+#        -v PARQUET=/scratch/mk27/mj8805/hogg18/hogg18_spectra.parquet,ALLSTAR=/scratch/mk27/mj8805/hogg18/hogg18_allstar.fits,OUT=/scratch/mk27/mj8805/hogg18/spphot_results_hogg18.parquet,PIXEL_MASK_DIR=,TRAIN_COL=hogg_training_set,SAMPLE_COL=hogg_sample,CLIP_SIGMA=0,BAD_FRAC=0.95,PENALTY=l1,LAM_SCAN="0.001;0.003;0.01;0.03;0.1;0.3" \
 #        run_full_gadi.pbs
 # --------------------------------------------------------------------------
 
@@ -68,6 +70,9 @@ BATCH_ROWS="${BATCH_ROWS:-20000}"
 # default suits the DR17 pipeline masks; Eilers-style masking (assemble_hogg18)
 # needs ~0.95 (see the Hogg+18 recipe above)
 BAD_FRAC="${BAD_FRAC:-0.01}"
+# regularizer that LAM/LAM_SCAN control: l2 = ridge (default), l1 = Paper I's
+# sparsity prior on the spectral coefficients only (different lam scale — rescan)
+PENALTY="${PENALTY:-l2}"
 # per-telescope pixel_lit_mask_<tel>.npy live here (keep only lit pixels);
 # '-' not ':-' so qsub -v PIXEL_MASK_DIR= (empty) disables the masking
 PIXEL_MASK_DIR="${PIXEL_MASK_DIR-${SRC}/pixel_mask}"
@@ -84,7 +89,7 @@ export OPENBLAS_NUM_THREADS="${OMP_NUM_THREADS}"
 mkdir -p "$(dirname "${OUT}")"
 echo "[pbs] host=$(hostname) ncpus=${PBS_NCPUS:-?} parquet=${PARQUET}"
 echo "[pbs] allstar=${ALLSTAR}"
-echo "[pbs] out=${OUT} lam=${LAM} lam_scan=${LAM_SCAN:-<none>} clip_sigma=${CLIP_SIGMA} batch_rows=${BATCH_ROWS} bad_frac=${BAD_FRAC}"
+echo "[pbs] out=${OUT} penalty=${PENALTY} lam=${LAM} lam_scan=${LAM_SCAN:-<none>} clip_sigma=${CLIP_SIGMA} batch_rows=${BATCH_ROWS} bad_frac=${BAD_FRAC}"
 echo "[pbs] pixel_mask_dir=${PIXEL_MASK_DIR:-<disabled>} train_col=${TRAIN_COL:-<snr/flags cut>} sample_col=${SAMPLE_COL:-<seeded>}"
 
 ${PYTHON_BIN} run_full_gadi.py \
@@ -92,6 +97,7 @@ ${PYTHON_BIN} run_full_gadi.py \
     --allstar "${ALLSTAR}" \
     --out     "${OUT}" \
     --lam     "${LAM}" \
+    --penalty "${PENALTY}" \
     --batch-rows "${BATCH_ROWS}" \
     --bad-frac "${BAD_FRAC}" \
     --pixel-mask-dir "${PIXEL_MASK_DIR}" \
