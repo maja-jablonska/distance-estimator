@@ -74,13 +74,15 @@ def load_apogee_windows(path, width):
 # ----------------------------------------------------------------------
 # metadata: allStar FITS  +  parquet scalar columns, merged on sdss_id
 # ----------------------------------------------------------------------
-def load_metadata(parquet_path, allstar_path, dataset="dr17", aux_phot_path=None):
+def load_metadata(parquet_path, allstar_path, dataset="dr17", aux_phot_path=None,
+                  extra_cols=()):
     import pandas as pd
     import pyarrow.parquet as pq
     from astropy.io import fits
 
     spec_ds = get_dataset(dataset)
-    meta_cols = ["sdss_id", "plx", "e_plx", *spec_ds.bands, "r_med_photogeo"]
+    meta_cols = ["sdss_id", "plx", "e_plx", *spec_ds.bands, "r_med_photogeo",
+                 *extra_cols]
 
     log("reading allStar metadata table ...")
     a = fits.open(allstar_path)[2].data            # extension 2 holds the table
@@ -255,13 +257,19 @@ def build_lnflux_streaming(parquet_path, keep_mask, f_max=2.0, bad_frac_max=0.01
 # ----------------------------------------------------------------------
 def prepare_sample(parquet, allstar, *, dataset="dr17", aux_phot_path=None,
                    snr_min=100.0, bad_frac=0.01, batch_rows=20000,
-                   pixel_mask_dir=None, seed=42):
+                   pixel_mask_dir=None, seed=42, train_col=None, sample_col=None):
     """Load + assemble the modelling sample once, so every model (linear or NN) is
     trained and scored on identical features/targets/splits: allStar+parquet
     metadata (photometry per the DatasetSpec, optionally aux-overridden), the
     Gaia parallax zero-point (plx_corr = plx - zeropoint), the per-telescope
     lit-pixel masks, the quality-cut training set (no parallax/S-N cut), a
     reproducible A/B split, and the streamed ln-flux matrix.
+
+    train_col / sample_col name allStar columns that OVERRIDE the default
+    snr/flags training cut and the seeded A/B split (e.g. hogg_training_set /
+    hogg_sample on the hogg18 dataset, for the exact Paper I split). The
+    finite-parallax guards still apply to train; rows whose sample_col value
+    is not 'A'/'B' keep the seeded assignment.
 
     Returns a dict of kept-row arrays (parquet row order, restricted to stars with
     complete photometry):
@@ -274,7 +282,9 @@ def prepare_sample(parquet, allstar, *, dataset="dr17", aux_phot_path=None,
     """
     spec_ds = get_dataset(dataset)
     tel_masks = load_pixel_masks(pixel_mask_dir)
-    merged, n_parquet = load_metadata(parquet, allstar, spec_ds, aux_phot_path)
+    merged, n_parquet = load_metadata(
+        parquet, allstar, spec_ds, aux_phot_path,
+        extra_cols=tuple(c for c in (train_col, sample_col) if c))
 
     phot_all = merged[list(spec_ds.phot_cols)].to_numpy(float)
     # completeness cut on the BANDS only (survey_ind is a constructed 0/1 flag)
@@ -295,6 +305,12 @@ def prepare_sample(parquet, allstar, *, dataset="dr17", aux_phot_path=None,
         f"{n_no_zpt} stars have plx but no zeropoint (dropped from training)")
     train = (keep & (snr_ok > snr_min) & (flags == 0)
              & np.isfinite(plx_all) & np.isfinite(err_all) & (err_all > 0))
+    if train_col:
+        flagged = np.nan_to_num(merged[train_col].to_numpy(float)) > 0
+        train = (keep & flagged & np.isfinite(plx_all) & np.isfinite(err_all)
+                 & (err_all > 0))
+        log(f"train override '{train_col}': {int(flagged.sum())} flagged -> "
+            f"{int(train.sum())} kept after photometry/parallax guards")
 
     # reproducible 50/50 A/B split, stratified on train / non-train
     rng = np.random.default_rng(seed)
@@ -302,6 +318,15 @@ def prepare_sample(parquet, allstar, *, dataset="dr17", aux_phot_path=None,
     for mask in (train, keep & ~train):
         idx = np.where(mask)[0]
         sample[idx[rng.permutation(len(idx))[:len(idx) // 2]]] = "A"
+    if sample_col:
+        # FITS string columns come back as bytes -> decode before comparing
+        raw = merged[sample_col].to_numpy()
+        dec = np.array([v.decode() if isinstance(v, bytes) else str(v)
+                        for v in raw])
+        ok = np.isin(dec, ("A", "B"))
+        sample = np.where(ok, dec, sample)
+        log(f"sample override '{sample_col}': {int(ok.sum())}/{n_parquet} rows "
+            f"(others keep the seeded split)")
     log(f"training stars: {train.sum()}  | negative plx kept: "
         f"{100*(plx_all[train] < 0).mean():.1f}%")
 

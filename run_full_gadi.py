@@ -58,6 +58,12 @@ def main():
                     help="photometry dataset spec (spphot.datasets registry)")
     ap.add_argument("--aux-phot", default=None,
                     help="auxiliary photometry parquet (dataset must declare aux_phot)")
+    ap.add_argument("--train-col", default=None,
+                    help="allStar column overriding the snr/flags training cut "
+                         "(e.g. hogg_training_set for the exact Paper I split)")
+    ap.add_argument("--sample-col", default=None,
+                    help="allStar 'A'/'B' column overriding the seeded A/B split "
+                         "(e.g. hogg_sample)")
     args = ap.parse_args()
     import pandas as pd
 
@@ -65,7 +71,8 @@ def main():
     S = prepare_sample(args.parquet, args.allstar, dataset=spec_ds,
                        aux_phot_path=args.aux_phot, snr_min=args.snr_min,
                        bad_frac=args.bad_frac, batch_rows=args.batch_rows,
-                       pixel_mask_dir=args.pixel_mask_dir, seed=args.seed)
+                       pixel_mask_dir=args.pixel_mask_dir, seed=args.seed,
+                       train_col=args.train_col, sample_col=args.sample_col)
     phot_k, X_spec = S["phot"], S["spec"]
     plx_k, err_k = S["plx"], S["err"]                 # plx_k is zero-point corrected
     plx_raw_k, zpt_k = S["plx_raw"], S["zeropoint"]

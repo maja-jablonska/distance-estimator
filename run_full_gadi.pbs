@@ -27,6 +27,14 @@
 #   qsub run_full_gadi.pbs
 #   # override paths / lambda without editing this file:
 #   qsub -v LAM=0.03 run_full_gadi.pbs
+#
+# Hogg+18 reproduction (assemble_hogg18.py outputs, ~45k stars): the exact
+# paper split comes from the allStar hogg_training_set / hogg_sample columns,
+# pixel masks off (DR14 aspcapStar; the data-quality mask alone matches the
+# paper), clip off (no sigma-clip in Paper I). Small sample -> small request:
+#   qsub -l ncpus=16,mem=64GB,walltime=02:00:00 \
+#        -v PARQUET=/scratch/mk27/mj8805/hogg18/hogg18_spectra.parquet,ALLSTAR=/scratch/mk27/mj8805/hogg18/hogg18_allstar.fits,OUT=/scratch/mk27/mj8805/hogg18/spphot_results_hogg18.parquet,PIXEL_MASK_DIR=,TRAIN_COL=hogg_training_set,SAMPLE_COL=hogg_sample,CLIP_SIGMA=0 \
+#        run_full_gadi.pbs
 # --------------------------------------------------------------------------
 
 set -euo pipefail
@@ -51,8 +59,12 @@ LAM_SCAN="${LAM_SCAN:-}"
 #   qsub -v CLIP_SIGMA=0 run_full_gadi.pbs
 CLIP_SIGMA="${CLIP_SIGMA:-4}"
 BATCH_ROWS="${BATCH_ROWS:-20000}"
-# per-telescope pixel_lit_mask_<tel>.npy live here (keep only lit pixels)
-PIXEL_MASK_DIR="${PIXEL_MASK_DIR:-${SRC}/pixel_mask}"
+# per-telescope pixel_lit_mask_<tel>.npy live here (keep only lit pixels);
+# '-' not ':-' so qsub -v PIXEL_MASK_DIR= (empty) disables the masking
+PIXEL_MASK_DIR="${PIXEL_MASK_DIR-${SRC}/pixel_mask}"
+# allStar columns overriding the training cut / A/B split (Hogg+18 replication)
+TRAIN_COL="${TRAIN_COL:-}"
+SAMPLE_COL="${SAMPLE_COL:-}"
 
 # threads: the fit is now pure NumPy/BLAS (Gauss-Newton X^T diag(w) X per iteration),
 # so give BLAS the whole node — this is the genuinely multi-core part.
@@ -64,7 +76,7 @@ mkdir -p "$(dirname "${OUT}")"
 echo "[pbs] host=$(hostname) ncpus=${PBS_NCPUS:-?} parquet=${PARQUET}"
 echo "[pbs] allstar=${ALLSTAR}"
 echo "[pbs] out=${OUT} lam=${LAM} lam_scan=${LAM_SCAN:-<none>} clip_sigma=${CLIP_SIGMA} batch_rows=${BATCH_ROWS}"
-echo "[pbs] pixel_mask_dir=${PIXEL_MASK_DIR}"
+echo "[pbs] pixel_mask_dir=${PIXEL_MASK_DIR:-<disabled>} train_col=${TRAIN_COL:-<snr/flags cut>} sample_col=${SAMPLE_COL:-<seeded>}"
 
 ${PYTHON_BIN} run_full_gadi.py \
     --parquet "${PARQUET}" \
@@ -74,6 +86,8 @@ ${PYTHON_BIN} run_full_gadi.py \
     --batch-rows "${BATCH_ROWS}" \
     --pixel-mask-dir "${PIXEL_MASK_DIR}" \
     --clip-sigma "${CLIP_SIGMA}" \
-    ${LAM_SCAN:+--lam-scan "${LAM_SCAN}"}
+    ${LAM_SCAN:+--lam-scan "${LAM_SCAN}"} \
+    ${TRAIN_COL:+--train-col "${TRAIN_COL}"} \
+    ${SAMPLE_COL:+--sample-col "${SAMPLE_COL}"}
 
 echo "[pbs] done -> ${OUT}"
