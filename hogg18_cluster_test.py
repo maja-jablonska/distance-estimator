@@ -124,18 +124,22 @@ def select_members(meta, pm):
     return members
 
 
-def report(meta, members, plx_sp, err_sp, tag):
-    """Per-cluster metrics table for one set of predictions."""
+def report(meta, members, plx_sp, err_sp, tag, logg=None, detail=True):
+    """Per-cluster metrics table for one set of predictions, plus (detail=True)
+    a per-member breakdown sorted by |chi| so the internal-chi2 drivers are
+    visible: chi = (member sp - cluster IVW sp mean) / member err_sp."""
     print(f"\n=== cluster test [{tag}]  (Gaia = raw DR2; offset=+{ZEROPOINT_MAS} "
           f"applied to the comparison, as trained) ===")
     print(f"  {'cluster':<6} {'N':>3} {'sp_mean':>8} {'gaia_raw':>9} "
           f"{'Δ(sp-gaia-zp)':>13} {'σ':>6} {'tight%':>7} {'intχ²':>6}")
     out = {}
+    snr = meta["snr"].to_numpy(float)
+    plx_a = meta["plx"].to_numpy(float)
+    err_a = meta["e_plx"].to_numpy(float)
+    ids = meta["sdss_id"].to_numpy()
     for name, idx in members.items():
         idx = idx[np.isfinite(plx_sp[idx])]
-        r = cluster_metrics(plx_sp[idx], err_sp[idx],
-                            meta["plx"].to_numpy(float)[idx],
-                            meta["e_plx"].to_numpy(float)[idx],
+        r = cluster_metrics(plx_sp[idx], err_sp[idx], plx_a[idx], err_a[idx],
                             offset=+ZEROPOINT_MAS)   # sp is trained on plx_raw+zp
         out[name] = r
         print(f"  {name:<6} {r['n']:>3} {r['sp_mean']:>8.3f} {r['gaia_mean']:>9.3f} "
@@ -144,6 +148,21 @@ def report(meta, members, plx_sp, err_sp, tag):
               f"{r['internal_chi2']:>6.1f}")
     print("  σ: spec-vs-Gaia IVW-mean offset in combined sigma (|σ|<~2-3 ok)")
     print("  intχ²: member spread / quoted err (Gaia-free; >>1 = overconfident errors)")
+    if detail:
+        for name, idx in members.items():
+            idx = idx[np.isfinite(plx_sp[idx])]
+            chi = (plx_sp[idx] - out[name]["sp_mean"]) / err_sp[idx]
+            order = np.argsort(-np.abs(chi))
+            print(f"\n  -- {name} members by |chi| ({tag}); "
+                  f"chi2 contributions sum to N*intχ² --")
+            print(f"     {'sdss_id':<20} {'S/N':>5} {'logg':>5} "
+                  f"{'gaia±err':>15} {'sp±err':>15} {'chi':>6}")
+            for j in order:
+                i = idx[j]
+                lg = logg[i] if logg is not None else meta['logg'].to_numpy(float)[i]
+                print(f"     {str(ids[i]):<20} {snr[i]:>5.0f} {lg:>5.2f} "
+                      f"{plx_a[i]:>7.3f}±{err_a[i]:<6.3f} "
+                      f"{plx_sp[i]:>7.3f}±{err_sp[i]:<6.3f} {chi[j]:>+6.1f}")
     return out
 
 
@@ -233,7 +252,7 @@ def main():
     # paper's own predictions (Fig. 4 as published)
     report(meta, members,
            meta["spec_parallax"].to_numpy(float),
-           meta["spec_parallax_err"].to_numpy(float), tag="paper")
+           meta["spec_parallax_err"].to_numpy(float), tag="paper", logg=logg)
 
     if args.results:
         res = pd.read_parquet(args.results,
@@ -241,7 +260,7 @@ def main():
         m = meta[["sdss_id"]].merge(res, on="sdss_id", how="left")
         plx_sp = m["plx_sp"].to_numpy(float)
         err_sp = m["err_sp"].to_numpy(float)
-        report(meta, members, plx_sp, err_sp, tag="ours")
+        report(meta, members, plx_sp, err_sp, tag="ours", logg=logg)
         fig4(meta, members, plx_sp, err_sp, logg, "ours", args.fig)
     else:
         fig4(meta, members,
