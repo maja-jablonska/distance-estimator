@@ -111,10 +111,16 @@ def load_metadata(parquet_path, allstar_path, dataset="dr17", aux_phot_path=None
     has_zpt = "zeropoint" in avail
     if has_zpt:
         scalar_cols.append("zeropoint")
+    has_ok = "spectrum_ok" in avail
+    if has_ok:
+        scalar_cols.append("spectrum_ok")
     meta = pq.read_table(parquet_path, columns=scalar_cols).to_pandas()
     if not has_zpt:
         meta["zeropoint"] = np.nan
         log("parquet has no 'zeropoint' column -> parallax zero-point correction disabled")
+    if not has_ok:
+        # builders that don't record download success imply every row has a spectrum
+        meta["spectrum_ok"] = True
     n_parquet = len(meta)
 
     # left join keeps parquet row order, so it stays aligned to the streamed spectra
@@ -247,6 +253,15 @@ def build_lnflux_streaming(parquet_path, keep_mask, f_max=2.0, bad_frac_max=0.01
         good = bad_count < bad_frac_max * n_keep
         log(f"spectra done: grid={width}, good pixels kept={int(good.sum())} "
             f"(Hogg+18 kept 7405)")
+        if not good.any():
+            raise RuntimeError(
+                f"good-pixel mask is EMPTY: every pixel is bad in >= "
+                f"{bad_frac_max:.0%} of the {n_keep} kept stars, so the fit "
+                f"would silently run on photometry alone. Loosen --bad-frac "
+                f"(per-star bad pixels are imputed to ln f = 0, so the shared "
+                f"mask only needs to drop never-lit pixels — e.g. 0.95 for "
+                f"Eilers-style ivar=0 masking) and check for all-bad "
+                f"placeholder rows (missing spectra).")
     X_spec = lnfull[:, good].copy()                              # (n_keep, L) float32
     del lnfull                                                   # free the full grid
     return X_spec, good, star_bad
@@ -290,6 +305,14 @@ def prepare_sample(parquet, allstar, *, dataset="dr17", aux_phot_path=None,
     # completeness cut on the BANDS only (survey_ind is a constructed 0/1 flag)
     keep = np.isfinite(phot_all[:, :len(spec_ds.bands)]).all(axis=1)
     log(f"keep (complete photometry): {keep.sum()} / {n_parquet}")
+    # drop rows whose spectrum download failed: the builder stores them as
+    # all-bad placeholders (cont=0, ivar=0), which would both poison the shared
+    # good-pixel mask and enter training with all-zero ln-flux features
+    spec_ok = merged["spectrum_ok"].to_numpy(bool)
+    if not spec_ok.all():
+        keep &= spec_ok
+        log(f"keep (spectrum_ok): dropped {int((~spec_ok).sum())} rows with "
+            f"missing spectra -> {keep.sum()} kept")
 
     # zero-point: plx_corr = plx - zeropoint (NaN for non-5/6-param sources -> the
     # isfinite(plx_corr) cut below drops them from training)
